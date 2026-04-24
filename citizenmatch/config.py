@@ -23,7 +23,7 @@ IMPERSONATE_SA = os.environ.get("IMPERSONATE_SA", "")
 # ---------------------------------------------------------------------------
 DLP_TEMPLATE_NAME = (
     f"projects/{PROJECT_ID}/locations/{LOCATION}"
-    "/deidentifyTemplates/5831179123004269403"
+    "/deidentifyTemplates/4648784086040580254"
 )
 DLP_BATCH_SIZE = 200
 MAX_RETRIES    = 6
