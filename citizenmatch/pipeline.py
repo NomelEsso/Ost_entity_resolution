@@ -23,9 +23,9 @@ import google.auth
 from google.auth import impersonated_credentials as ic
 
 from config import (
-    PROJECT_ID, LOCATION, DATASET, IMPERSONATE_SA,
+    PROJECT_ID, LOCATION, IMPERSONATE_SA,
     DLP_TEMPLATE_NAME, DLP_BATCH_SIZE, MAX_RETRIES, BQ_CHUNK_ROWS,
-    KELMAR_STAGING, SOK_STAGING,
+    KELMAR_STAGING, SOK_STAGING, SOK_MAX_ROWS,
     KELMAR_TOKENIZED, SOK_TOKENIZED,
     KELMAR_CLEAN, SOK_CLEAN, SOK_NULL_CLEAN,
     KELMAR_UNMATCHED, KELMAR_FUZZY, FUZZY_POOL,
@@ -147,7 +147,7 @@ def tokenize_kelmar(bq, dlp):
     df = bq.query(f"""
         SELECT OwnerID, PropertyID,
                NameLast, NameFirst, NameMiddle,
-               Address1, Address2, Address3,
+               Address1, CAST(Address2 AS STRING) AS Address2, CAST(Address3 AS STRING) AS Address3,
                City, State, Zip,
                CAST(SSN AS STRING) AS SSN,
                BirthDT, CashValue
@@ -199,11 +199,15 @@ def tokenize_sok(bq, dlp):
               CAST(DLN AS STRING) AS DLN,
               CAST(SSN AS STRING) AS SSN,
               First_Name, Middle_Name, Last_Name, Suffix, Date_of_Birth,
-              Residential_Address_Street, Residential_Address_Street_2,
-              Residential_Address_Unit_Type, Residential_Address_Unit,
+              Residential_Address_Street,
+              CAST(Residential_Address_Street_2 AS STRING) AS Residential_Address_Street_2,
+              CAST(Residential_Address_Unit_Type AS STRING) AS Residential_Address_Unit_Type,
+              CAST(Residential_Address_Unit AS STRING) AS Residential_Address_Unit,
               Residential_Address_City, Residential_Address_State, Residential_Address_Zip,
-              Mailing_Address_Street, Mailing_Address_Street_2,
-              Mailing_Address_Unit_Type, Mailing_Address_Unit,
+              Mailing_Address_Street,
+              CAST(Mailing_Address_Street_2 AS STRING) AS Mailing_Address_Street_2,
+              CAST(Mailing_Address_Unit_Type AS STRING) AS Mailing_Address_Unit_Type,
+              CAST(Mailing_Address_Unit AS STRING) AS Mailing_Address_Unit,
               Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip
             FROM `{SOK_STAGING}`
             {where}
@@ -242,6 +246,11 @@ def tokenize_sok(bq, dlp):
         total += len(chunk)
         log.info("  wrote %d rows (total: %d)", len(chunk), total)
 
+        # Test mode: stop after SOK_MAX_ROWS (0 = no limit)
+        if SOK_MAX_ROWS and total >= SOK_MAX_ROWS:
+            log.info("  test limit reached (%d rows), stopping SOK tokenization", SOK_MAX_ROWS)
+            break
+
     log.info("✅ SOK tokenized: %d rows → %s", total, SOK_TOKENIZED)
 
 
@@ -275,10 +284,33 @@ def clean_sok_null_table(bq):
     """Extract and clean SOK rows where SSN IS NULL → sok_ssn_null_clean_v1."""
     log.info("Cleaning SOK (SSN-null)...")
 
-    # Extract raw SSN-null subset
+    # Extract SSN-null subset with explicit column types
+    # (SELECT * would bring raw types that don't match the tokenized pipeline)
+    limit_clause = f"LIMIT {SOK_MAX_ROWS}" if SOK_MAX_ROWS else ""
     bq.query(f"""
         CREATE OR REPLACE TABLE `{SOK_NULL_CLEAN}` AS
-        SELECT * FROM `{SOK_STAGING}` WHERE SSN IS NULL
+        SELECT
+          COALESCE(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
+          COALESCE(CAST(_data_file_date_ AS STRING), '') AS _data_file_date_,
+          Transaction_Date,
+          Transaction_Type,
+          CAST(DLN AS STRING) AS DLN,
+          First_Name, Middle_Name, Last_Name, Suffix,
+          Date_of_Birth,
+          Residential_Address_Street,
+          CAST(Residential_Address_Street_2 AS STRING) AS Residential_Address_Street_2,
+          CAST(Residential_Address_Unit_Type AS STRING) AS Residential_Address_Unit_Type,
+          CAST(Residential_Address_Unit AS STRING) AS Residential_Address_Unit,
+          Residential_Address_City, Residential_Address_State, Residential_Address_Zip,
+          Mailing_Address_Street,
+          CAST(Mailing_Address_Street_2 AS STRING) AS Mailing_Address_Street_2,
+          CAST(Mailing_Address_Unit_Type AS STRING) AS Mailing_Address_Unit_Type,
+          CAST(Mailing_Address_Unit AS STRING) AS Mailing_Address_Unit,
+          Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip
+        FROM `{SOK_STAGING}`
+        WHERE SSN IS NULL
+          AND DLN IS NOT NULL
+        {limit_clause}
     """).result()
 
     # Load, clean, write back
@@ -621,6 +653,12 @@ def enrich_review_table(bq):
     """Add CashValue + Deceased flag → treasury_match_review_v3."""
     log.info("Enriching with CashValue and Deceased flag...")
 
+    # Skip if review table is empty (avoids type errors on empty tables)
+    row_count = bq.query(f"SELECT COUNT(*) AS n FROM `{REVIEW_TABLE}`").to_dataframe()["n"].iloc[0]
+    if row_count == 0:
+        log.info("Review table is empty — skipping enrichment")
+        return
+
     bq.query(f"""
         CREATE OR REPLACE TABLE `{REVIEW_ENRICHED}` AS
         WITH deceased_person AS (
@@ -631,8 +669,8 @@ def enrich_review_table(bq):
         SELECT t.*, k.CashValue, d.Deceased
         FROM `{REVIEW_TABLE}` t
         LEFT JOIN `{KELMAR_CLEAN}` k
-          ON t.OwnerID = k.OwnerID AND t.PropertyID = k.PropertyID
-        LEFT JOIN deceased_person d ON t.DLN = d.DLN
+          ON CAST(t.OwnerID AS INT64) = k.OwnerID AND CAST(t.PropertyID AS INT64) = k.PropertyID
+        LEFT JOIN deceased_person d ON CAST(t.DLN AS STRING) = d.DLN
     """).result()
 
     log.info("✅ Enriched → %s", REVIEW_ENRICHED)
@@ -641,6 +679,11 @@ def enrich_review_table(bq):
 def cap_and_deliver(bq):
     """Cap fuzzy to top-1 per property, add eligibility → capped_v2."""
     log.info("Capping candidates and building delivery table...")
+
+    row_count = bq.query(f"SELECT COUNT(*) AS n FROM `{REVIEW_TABLE}`").to_dataframe()["n"].iloc[0]
+    if row_count == 0:
+        log.info("No matches to cap — skipping")
+        return
 
     # Capped v1 (without enrichment)
     bq.query(f"""
@@ -681,6 +724,22 @@ def cap_and_deliver(bq):
 def build_unmatched_table(bq):
     """Kelmar properties with no match at all → treasury_unmatched_v1."""
     log.info("Building unmatched table...")
+
+    row_count = bq.query(f"SELECT COUNT(*) AS n FROM `{REVIEW_TABLE}`").to_dataframe()["n"].iloc[0]
+    if row_count == 0:
+        log.info("No matches — all Kelmar records are unmatched")
+        bq.query(f"""
+            CREATE OR REPLACE TABLE `{UNMATCHED_TABLE}` AS
+            SELECT OwnerID, PropertyID,
+                   full_name_clean AS kelmar_name,
+                   street_clean AS kelmar_street, city_clean AS kelmar_city,
+                   state_clean AS kelmar_state, zip_clean AS kelmar_zip,
+                   BirthDT
+            FROM `{KELMAR_CLEAN}`
+        """).result()
+        count = bq.query(f"SELECT COUNT(*) AS n FROM `{UNMATCHED_TABLE}`").to_dataframe()
+        log.info("Unmatched: %s rows (all Kelmar)", count["n"].iloc[0])
+        return
 
     bq.query(f"""
         CREATE OR REPLACE TABLE `{UNMATCHED_TABLE}` AS
