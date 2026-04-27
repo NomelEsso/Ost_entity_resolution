@@ -8,6 +8,7 @@ Stages:
   4. Fuzzy matching (Block 1: ZIP+Last+DOB, Block 2: ZIP+Last)
   5. Combine, dedupe, enrich, cap candidates
   6. Produce delivery + unmatched tables
+  7. Publish MPI output with dated table name
 
 Called by main.py via run_pipeline().
 """
@@ -35,6 +36,7 @@ from config import (
     REVIEW_TABLE, REVIEW_ENRICHED,
     REVIEW_CAPPED_V1, REVIEW_CAPPED_V2,
     UNMATCHED_TABLE,
+    MPI_OUTPUT_PREFIX,
     BLOCK1_CONFIDENCE_CAP, BLOCK2_CONFIDENCE_CAP,
     AUTO_APPROVE_THRESHOLD, REVIEW_THRESHOLD,
     NAME_WEIGHT, STREET_WEIGHT,
@@ -760,6 +762,37 @@ def build_unmatched_table(bq):
 
 
 # ===========================================================================
+# Stage 6: Publish MPI output
+# ===========================================================================
+
+def publish_mpi_output(bq):
+    """Copy final capped results to citizen_mpi_result with dated table name.
+
+    Table name: OK_OST_OMES_Output_DataMatch_CCYYMMDD
+    Date is when the pipeline runs and produces the output.
+    """
+    log.info("Publishing MPI output...")
+
+    row_count = bq.query(f"SELECT COUNT(*) AS n FROM `{REVIEW_TABLE}`").to_dataframe()["n"].iloc[0]
+    if row_count == 0:
+        log.info("No matches to publish — skipping MPI output")
+        return
+
+    # Date the pipeline produces the output
+    land_date = datetime.utcnow().strftime("%Y%m%d")
+
+    output_table = f"{MPI_OUTPUT_PREFIX}_{land_date}"
+
+    bq.query(f"""
+        CREATE OR REPLACE TABLE `{output_table}` AS
+        SELECT * FROM `{REVIEW_CAPPED_V2}`
+    """).result()
+
+    count = bq.query(f"SELECT COUNT(*) AS n FROM `{output_table}`").to_dataframe()
+    log.info("✅ MPI output: %s rows → %s", count["n"].iloc[0], output_table)
+
+
+# ===========================================================================
 # Entry point
 # ===========================================================================
 
@@ -796,6 +829,9 @@ def run_pipeline():
     enrich_review_table(bq)
     cap_and_deliver(bq)
     build_unmatched_table(bq)
+
+    # Stage 6: Publish MPI output
+    publish_mpi_output(bq)
 
     elapsed = time.time() - start
     log.info("=" * 60)

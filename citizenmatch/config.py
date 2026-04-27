@@ -10,6 +10,7 @@ LOCATION   = os.environ.get("LOCATION", "us-central1")
 
 STAGING_DATASET = os.environ.get("STAGING_DATASET", "citizen_staging")
 OUTPUT_DATASET  = os.environ.get("OUTPUT_DATASET", "citizen_match")
+MPI_DATASET     = os.environ.get("MPI_DATASET", "citizen_mpi_result")
 
 IMPERSONATE_SA = os.environ.get("IMPERSONATE_SA", "")
 
@@ -25,7 +26,7 @@ BQ_CHUNK_ROWS  = 100000
 SOK_MAX_ROWS = int(os.environ.get("SOK_MAX_ROWS", "0"))
 
 SOK_STAGING    = f"{PROJECT_ID}.{STAGING_DATASET}.boost_staging"
-KELMAR_STAGING = f"{PROJECT_ID}.{STAGING_DATASET}.kelmar_staging_dataset"
+KELMAR_STAGING = f"{PROJECT_ID}.{STAGING_DATASET}.OK_OST_OMES_DataMatch"
 
 KELMAR_TOKENIZED  = f"{PROJECT_ID}.{OUTPUT_DATASET}.kelmar_staging_dataset_tokenized_v1"
 SOK_TOKENIZED     = f"{PROJECT_ID}.{OUTPUT_DATASET}.sok_staging_dataset_tokenized_v2"
@@ -45,8 +46,10 @@ REVIEW_TABLE      = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_match_review_v2"
 REVIEW_ENRICHED   = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_match_review_v3"
 REVIEW_CAPPED_V1  = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_match_review_capped_v1"
 REVIEW_CAPPED_V2  = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_match_review_capped_v2"
-DELIVERY_TABLE    = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_match_kelmar_delivery_v2"
 UNMATCHED_TABLE   = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_unmatched_v1"
+
+# Final MPI output — dated table name appended at runtime
+MPI_OUTPUT_PREFIX = f"{PROJECT_ID}.{MPI_DATASET}.OK_OST_OMES_Output_DataMatch"
 
 BLOCK1_CONFIDENCE_CAP  = 95
 BLOCK2_CONFIDENCE_CAP  = 85
