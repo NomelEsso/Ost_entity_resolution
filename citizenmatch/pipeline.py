@@ -83,6 +83,9 @@ def _get_dlp_client():
 def _write_to_bq(bq, df, table_id, truncate=True):
     """Load a DataFrame into BigQuery."""
     disposition = "WRITE_TRUNCATE" if truncate else "WRITE_APPEND"
+    # Force all object columns to string to prevent Pyarrow type inference errors
+    for col in df.select_dtypes(include=["object"]).columns:
+        df[col] = df[col].astype("string")
     job = bq.load_table_from_dataframe(
         df, table_id,
         job_config=bigquery.LoadJobConfig(write_disposition=disposition),
