@@ -123,18 +123,17 @@ All table names, project IDs, thresholds, and tuning constants live here. **Neve
 - Batch size = `DLP_BATCH_SIZE`, exponential backoff on 429 / `ResourceExhausted`.
 
 ### 2. Clean
-- Identical cleaners on Kelmar, SOK, and SOK-null paths: accent-strip → upper → drop titles → standardize directionals (`NORTH`→`N`) and street types (`STREET`→`ST`) → collapse whitespace.
+- Identical cleaners on Kelmar, SOK, and SOK-null paths.
+- **Names** (`clean_name`): accent-strip → upper → drop titles (`MR`, `MRS`, `DR`, `PROF`, `REV`, `JUDGE`, etc.) → strip non-name punctuation → collapse whitespace.
+- **Street** (`clean_street`): accent-strip → upper → normalize PO Box variants (`P.O. BOX`, `PO Box` → `PO BOX`) → collapse `APARTMENT`/`APT` to `APT` and `SUITE`/`STE` to `STE` → rewrite `#X` as `APT X` → standardize directionals (`NORTH` → `N`) and street types (`STREET` → `ST`) → strip remaining punctuation → collapse whitespace. **Titles are NOT dropped from streets** — street names commonly contain title-shaped tokens (`DR MARTIN LUTHER KING BLVD`, `JUDGE HARRIS PKWY`) and stripping them would corrupt the address.
+- **State** (`clean_state`): accent-strip → upper → keep first 2 letters only.
+- **Zip** (`clean_zip`): keep first 5 digits only.
 - Outputs: `KELMAR_CLEAN`, `SOK_CLEAN`, `SOK_NULL_CLEAN`.
 
 ### 3. Deterministic match
 - `JOIN ON k.ssn_token = s.ssn_token`.
-- Bucket logic (assigned in the **combine** step, not at join time):
-  - Names match exactly → `DET_AUTO_APPROVE`
-  - `name_score >= AUTO_APPROVE_THRESHOLD` → `DET_REVIEW_MINOR`
-  - `name_score >= REVIEW_THRESHOLD` → `DET_REVIEW_MODERATE`
-  - else → `DET_REVIEW_MISMATCH`
+- Output: `DET_MATCHES`. **No `bucket` or `match_flag` column on this table** — those are assigned in Stage 5.
 - Confidence is computed as `100 * composite_score / 100` for deterministic rows.
-- Output: `DET_MATCHES`.
 
 ### 4. Fuzzy match
 Built only against Kelmar rows that did not match deterministically (`KELMAR_UNMATCHED` → `KELMAR_FUZZY`).
@@ -153,16 +152,60 @@ composite_score = NAME_WEIGHT * name_score + STREET_WEIGHT * street_score
 ```
 where `name_score` and `street_score` are `rapidfuzz.fuzz.WRatio(...)`.
 
-**Bucket thresholds (fuzzy):**
-- `confidence_score >= AUTO_APPROVE_THRESHOLD` → `FUZZY_AUTO_APPROVE`
-- `confidence_score >= REVIEW_THRESHOLD` → `FUZZY_REVIEW`
-- else → `FUZZY_REJECT`
-
-### 5. Combine + cap + enrich
+### 5. Combine + cap + enrich + bucket assignment
 - Union deterministic + Block 1 + Block 2 → `REVIEW_TABLE`.
+- **Bucket and `match_flag` are assigned here, in one place, for every row.** See the bucket logic block below.
 - Enrich with `CashValue` (Kelmar) and `Deceased` (SOK staging) → `REVIEW_ENRICHED`.
 - Cap to one candidate per `(OwnerID, PropertyID)` using `ROW_NUMBER()` ordered by `confidence_score DESC` → `REVIEW_CAPPED_V2`. Deterministic rows are always kept regardless of rank.
+- Add `Eligibility_Flag` column (see Eligibility section below).
 - Final delivery: dated table under `MPI_OUTPUT_PREFIX` in `citizen_mpi_result`. Scores rounded to 1 decimal.
+
+---
+
+## Bucket assignment logic (single source of truth)
+
+Every match is assigned a confidence bucket that determines its workflow: auto-approve, review, or reject. **This logic runs exactly once, in the combine step (Stage 5), against the unioned `REVIEW_TABLE`.** No intermediate table (`DET_MATCHES`, `BLOCK1_CLASSIFIED`, `BLOCK2_CLASSIFIED`) carries a competing `bucket` column.
+
+**Deterministic SSN matches.** The SSN confirms identity, so the bucket depends on whether the names also agree (since the SSN is the same on both sides):
+
+| Name agreement | bucket | match_flag |
+|---|---|---|
+| Exact match (case/whitespace ignored) | `DET_AUTO_APPROVE` | `NULL` |
+| `name_score >= 90` | `DET_REVIEW_MINOR` | `SSN_MATCH_NAME_MISMATCH` |
+| `name_score >= 80` | `DET_REVIEW_MODERATE` | `SSN_MATCH_NAME_MISMATCH` |
+| `name_score < 80` | `DET_REVIEW_MISMATCH` | `SSN_CONFLICT_DIFFERENT_IDENTITY` |
+
+The 3-state `match_flag` lets Treasury filter "slight name variation" vs. "completely different identity that happens to share an SSN token" (an upstream data-quality signal, not a pipeline bug).
+
+**Fuzzy matches.** No SSN confirmation, so the bucket is driven by `confidence_score`:
+
+| Condition | bucket |
+|---|---|
+| `confidence_score >= 90` | `FUZZY_AUTO_APPROVE` |
+| `confidence_score >= 80` | `FUZZY_REVIEW` |
+| `confidence_score < 80` | `FUZZY_REJECT` |
+
+Fuzzy rows leave `match_flag = NULL`.
+
+**Implementation rules:**
+- Use `AUTO_APPROVE_THRESHOLD` (90) and `REVIEW_THRESHOLD` (80) from `config.py`. Never hardcode.
+- Block 2 cannot reach `FUZZY_AUTO_APPROVE` because its confidence cap (85) is below the auto-approve threshold (90). This is by design.
+- After assignment, `assert combined["bucket"].isna().sum() == 0` before writing to BigQuery.
+
+---
+
+## Eligibility flag (delivered to Kelmar)
+
+`Eligibility_Flag` is a delivered column on the final MPI output. It tells Treasury / Kelmar whether a matched citizen is eligible to receive their unclaimed property.
+
+| Condition | Eligibility_Flag |
+|---|---|
+| `Deceased = TRUE` | `INELIGIBLE_DECEASED` |
+| Otherwise | `ELIGIBLE` |
+
+Set in Stage 5 alongside the cap step (when `REVIEW_CAPPED_V2` is built).
+
+**Today this is the only ineligibility reason.** If new rules are added later (minors, missing fields, etc.), add them as additional `INELIGIBLE_<REASON>` values — keep the `ELIGIBLE` / `INELIGIBLE_*` naming convention so existing Treasury filters keep working.
 
 ---
 
@@ -172,7 +215,7 @@ where `name_score` and `street_score` are `rapidfuzz.fuzz.WRatio(...)`.
 
 **SOK (`SOK_CLEAN`, `SOK_NULL_CLEAN`):** `DLN`, `Transaction_ID`, `_data_file_date_`, `Transaction_Date`, `Transaction_Type`, `First_Name`, `Middle_Name`, `Last_Name`, `Suffix`, `Date_of_Birth`, `Residential_Address_*`, `Mailing_Address_*`, `ssn_token` (null in null-clean table), plus the same `*_clean` fields as Kelmar. Note: these schemas come from the dev notebook against the old staging tables — **verify column names against `citizen_staging.boost_staging` and `citizen_staging.OK_OST_OMES_DataMatch` before writing new code; the new staging tables may differ.**
 
-**Final review (`REVIEW_ENRICHED`):** `OwnerID`, `PropertyID`, `DLN`, `Transaction_ID`, `_data_file_date_`, `kelmar_name/street/city/state/zip`, `BirthDT`, `sok_name/street/city/state/zip`, `Date_of_Birth`, `technique`, `name_score`, `street_score`, `composite_score`, `confidence_score`, `bucket`, `match_flag`, `CashValue`, `Deceased`.
+**Final review (`REVIEW_ENRICHED` / `REVIEW_CAPPED_V2`):** `OwnerID`, `PropertyID`, `DLN`, `Transaction_ID`, `_data_file_date_`, `kelmar_name/street/city/state/zip`, `BirthDT`, `sok_name/street/city/state/zip`, `Date_of_Birth`, `technique`, `name_score`, `street_score`, `composite_score`, `confidence_score`, `bucket`, `match_flag`, `CashValue`, `Deceased`, `Eligibility_Flag` (added in `REVIEW_CAPPED_V2`).
 
 ---
 
@@ -184,14 +227,15 @@ where `name_score` and `street_score` are `rapidfuzz.fuzz.WRatio(...)`.
 4. **`DET_AUTO_APPROVE` can show lower confidence than `DET_REVIEW_*` rows.** Confidence includes street score; bucket assignment does not. Expected, not a bug.
 5. **Block 2 will never auto-approve.** Confidence cap of 85 < threshold of 90. By design.
 6. **`Transaction_ID` can be NULL.** Use `COALESCE(CAST(Transaction_ID AS STRING), '')` in keyset pagination so rows are not skipped.
-7. **`SSN_CONFLICT_DIFFERENT_IDENTITY` flag.** When two clearly different identities share an SSN token, that's an upstream data-quality issue. Surface it via `match_flag` for Treasury review; don't try to "fix" it.
-8. **`SOK_MAX_ROWS = 500` test default.** A "successful" run in dev may only have processed 500 rows. Always confirm `SOK_MAX_ROWS` before claiming a full run.
+7. **`SOK_MAX_ROWS = 500` test default.** A "successful" run in dev may only have processed 500 rows. Always confirm `SOK_MAX_ROWS` before claiming a full run.
 
 ---
 
 ## Mandatory guardrails for any code change
 
 - Cleaners must remain **identical** between Kelmar, SOK, and SOK-null paths. If you change one, change all three. Drift here causes silent match loss.
+- **All BigQuery writes go through `_write_to_bq` in `pipeline.py`.** Direct `to_gbq` / `load_table_from_dataframe` calls are not allowed in new code. The helper centralizes dtype protection and the `null_buckets == 0` assertion — bypassing it means the next dtype fix or schema guard won't apply to your write site.
+- **Bucket and `match_flag` are assigned in exactly one place** — the combine step in `assemble_review_table`. No intermediate table (`DET_MATCHES`, `BLOCK1_CLASSIFIED`, `BLOCK2_CLASSIFIED`) carries a `bucket` column that competes with the final assignment. See the "Bucket assignment logic" section for the full rule.
 - Any new BigQuery write must `assert null_buckets == 0` (or equivalent for the column being validated).
 - Any new SOK join on DLN must use the latest-row pattern (`ROW_NUMBER() ... = 1`) unless you explicitly want full history.
 - Any DLP call must use `DLP_TEMPLATE_NAME` from config — never hardcode a template resource name.
