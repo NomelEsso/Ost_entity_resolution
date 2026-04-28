@@ -81,13 +81,22 @@ def _get_dlp_client():
 
 
 def _write_to_bq(bq, df, table_id, truncate=True):
-    """Load a DataFrame into BigQuery."""
+    """Load a DataFrame into BigQuery.
+
+    Single write site for the pipeline. Direct ``to_gbq`` /
+    ``load_table_from_dataframe`` calls are not allowed elsewhere — this
+    helper centralizes dtype protection and the bucket-completeness check.
+    """
     disposition = "WRITE_TRUNCATE" if truncate else "WRITE_APPEND"
-# Force ambiguous object columns to string, but preserve numeric columns
+    # Force ambiguous object columns to string, but preserve numeric columns
     for col in df.select_dtypes(include=["object"]).columns:
-        # Skip columns that should stay numeric
         if col not in ("name_score", "street_score", "confidence_score", "composite_score"):
             df[col] = df[col].astype("string")
+    if "bucket" in df.columns:
+        null_buckets = df["bucket"].isna().sum()
+        assert null_buckets == 0, (
+            f"Refusing to write {table_id}: {null_buckets} null buckets"
+        )
     job = bq.load_table_from_dataframe(
         df, table_id,
         job_config=bigquery.LoadJobConfig(write_disposition=disposition),
@@ -335,7 +344,11 @@ def clean_sok_null_table(bq):
 # ===========================================================================
 
 def deterministic_match(bq):
-    """Join Kelmar ↔ SOK on ssn_token (deduped by DLN) → ssn_deterministic_matches_v1."""
+    """Join Kelmar ↔ SOK on ssn_token (deduped by DLN) → ssn_deterministic_matches_v1.
+
+    Bucket and match_flag are NOT assigned here — Stage 5 (assemble_review_table)
+    is the single source of truth for those columns.
+    """
     log.info("Running deterministic SSN match...")
 
     bq.query(f"""
@@ -364,19 +377,7 @@ def deterministic_match(bq):
             s._data_file_date_,
             s.Transaction_ID, s.Transaction_Date, s.Transaction_Type,
 
-            k.ssn_token,
-
-            CASE
-                WHEN LOWER(TRIM(k.full_name_clean)) = LOWER(TRIM(s.full_name_clean))
-                    THEN 'DET_AUTO_APPROVE'
-                ELSE 'DET_REVIEW'
-            END AS bucket,
-
-            CASE
-                WHEN LOWER(TRIM(k.full_name_clean)) != LOWER(TRIM(s.full_name_clean))
-                    THEN 'SSN_MATCH_NAME_MISMATCH'
-                ELSE NULL
-            END AS match_flag
+            k.ssn_token
 
         FROM `{KELMAR_CLEAN}` k
         JOIN sok_dedup s ON k.ssn_token = s.ssn_token
@@ -468,7 +469,7 @@ def _block_candidates_sql(block_table, join_condition):
 
 
 def _score_and_classify(df, confidence_cap, block_name):
-    """Score candidate pairs and assign buckets. Returns the DataFrame."""
+    """Score candidate pairs. Bucket is assigned later in Stage 5."""
     df["name_score"] = df.apply(
         lambda r: similarity(r["kelmar_name"], r["sok_name"]), axis=1
     )
@@ -479,13 +480,6 @@ def _score_and_classify(df, confidence_cap, block_name):
         df["name_score"] * NAME_WEIGHT + df["street_score"] * STREET_WEIGHT
     )
     df["confidence_score"] = confidence_cap * (df["composite_score"] / 100)
-    df["bucket"] = np.where(
-        df["confidence_score"] >= AUTO_APPROVE_THRESHOLD, "FUZZY_AUTO_APPROVE",
-        np.where(
-            df["confidence_score"] >= REVIEW_THRESHOLD, "FUZZY_REVIEW",
-            "FUZZY_REJECT",
-        ),
-    )
     df["block_name"]      = block_name
     df["match_stage"]     = "FUZZY"
     df["scoring_version"] = "v1"
@@ -509,9 +503,8 @@ def fuzzy_block1(bq):
 
     df = _score_and_classify(df, BLOCK1_CONFIDENCE_CAP, "BLOCK1_ZIP_LAST_DOB")
 
-    df.to_gbq(BLOCK1_CLASSIFIED, project_id=PROJECT_ID, if_exists="replace")
+    _write_to_bq(bq, df, BLOCK1_CLASSIFIED)
     log.info("✅ Block 1 classified: %d rows", len(df))
-    log.info("  %s", df["bucket"].value_counts().to_dict())
 
 
 def fuzzy_block2(bq):
@@ -532,9 +525,8 @@ def fuzzy_block2(bq):
 
     df = _score_and_classify(df, BLOCK2_CONFIDENCE_CAP, "BLOCK2_ZIP_LAST")
 
-    df.to_gbq(BLOCK2_CLASSIFIED, project_id=PROJECT_ID, if_exists="replace")
+    _write_to_bq(bq, df, BLOCK2_CLASSIFIED)
     log.info("✅ Block 2 classified: %d rows", len(df))
-    log.info("  %s", df["bucket"].value_counts().to_dict())
 
 
 # ===========================================================================
@@ -542,23 +534,44 @@ def fuzzy_block2(bq):
 # ===========================================================================
 
 def assemble_review_table(bq):
-    """Merge deterministic + fuzzy results → treasury_match_review_v2."""
+    """Merge deterministic + fuzzy results → treasury_match_review_v2.
+
+    Single source of truth for bucket and match_flag. Every downstream row
+    gets its bucket assigned exactly once, here, after the union.
+    """
     log.info("Assembling final review table...")
 
     # --- DLN → latest Transaction_ID mapping ---
+    # Fuzzy matches can pull from SOK_NULL_CLEAN (SSN-null rows), so the map
+    # must cover both the SSN-tokenized rows and the SSN-null rows. Without
+    # the union, fuzzy matches whose DLN only exists in SOK_NULL_CLEAN come
+    # out with a NULL Transaction_ID after the merge.
     dln_map = bq.query(f"""
-        SELECT
-          CAST(DLN AS STRING) AS DLN,
-          NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
-          _data_file_date_
-        FROM `{SOK_TOKENIZED}`
-        WHERE DLN IS NOT NULL
+        WITH all_sok AS (
+          SELECT
+            CAST(DLN AS STRING) AS DLN,
+            NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
+            CAST(_data_file_date_ AS STRING) AS _data_file_date_,
+            Transaction_Date
+          FROM `{SOK_TOKENIZED}`
+          WHERE DLN IS NOT NULL
+          UNION ALL
+          SELECT
+            CAST(DLN AS STRING) AS DLN,
+            NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
+            CAST(_data_file_date_ AS STRING) AS _data_file_date_,
+            Transaction_Date
+          FROM `{SOK_NULL_CLEAN}`
+          WHERE DLN IS NOT NULL
+        )
+        SELECT DLN, Transaction_ID, _data_file_date_
+        FROM all_sok
         QUALIFY ROW_NUMBER() OVER (
-          PARTITION BY CAST(DLN AS STRING)
+          PARTITION BY DLN
           ORDER BY
             _data_file_date_ DESC,
             SAFE_CAST(Transaction_Date AS TIMESTAMP) DESC,
-            IF(NULLIF(CAST(Transaction_ID AS STRING), '') IS NULL, 1, 0) ASC
+            IF(Transaction_ID IS NULL, 1, 0) ASC
         ) = 1
     """).to_dataframe()
 
@@ -578,10 +591,7 @@ def assemble_review_table(bq):
             sc.full_name_clean AS sok_name, sc.street_clean AS sok_street,
             sc.city_clean AS sok_city, sc.state_clean AS sok_state,
             sc.zip_clean AS sok_zip, sc.Date_of_Birth,
-            'DETERMINISTIC_SSN' AS technique,
-            CASE WHEN LOWER(TRIM(k.full_name_clean)) != LOWER(TRIM(sc.full_name_clean))
-                 THEN 'SSN_MATCH_NAME_MISMATCH' ELSE NULL
-            END AS match_flag
+            'DETERMINISTIC_SSN' AS technique
         FROM `{DET_MATCHES}` d
         JOIN `{KELMAR_CLEAN}` k
           ON d.OwnerID = k.OwnerID AND d.PropertyID = k.PropertyID
@@ -598,13 +608,6 @@ def assemble_review_table(bq):
     )
     det["composite_score"] = det["name_score"] * NAME_WEIGHT + det["street_score"] * STREET_WEIGHT
     det["confidence_score"] = det["composite_score"]  # 100% ceiling for SSN match
-
-    det["bucket"] = np.where(
-        det["match_flag"].isna(), "DET_AUTO_APPROVE",
-        np.where(det["name_score"] >= 90, "DET_REVIEW_MINOR",
-                 np.where(det["name_score"] >= 80, "DET_REVIEW_MODERATE",
-                          "DET_REVIEW_MISMATCH")),
-    )
     det = det.merge(dln_map, on="DLN", how="left")
     log.info("  deterministic rows: %d", len(det))
 
@@ -623,17 +626,14 @@ def assemble_review_table(bq):
 
     b1 = b1.merge(dln_map, on="DLN", how="left")
     b2 = b2.merge(dln_map, on="DLN", how="left")
-    b1["match_flag"] = None
-    b2["match_flag"] = None
 
-    # --- Standardize columns ---
+    # --- Standardize columns (bucket / match_flag assigned after concat) ---
     cols = [
         "OwnerID", "PropertyID", "DLN",
         "Transaction_ID", "_data_file_date_",
         "kelmar_name", "kelmar_street", "kelmar_city", "kelmar_state", "kelmar_zip", "BirthDT",
         "sok_name", "sok_street", "sok_city", "sok_state", "sok_zip", "Date_of_Birth",
         "technique", "name_score", "street_score", "confidence_score", "composite_score",
-        "bucket", "match_flag",
     ]
 
     for label, df in [("det", det), ("block1", b1), ("block2", b2)]:
@@ -641,18 +641,53 @@ def assemble_review_table(bq):
         if missing:
             raise ValueError(f"{label} missing columns: {missing}")
 
-    # --- Combine + dedupe ---
     combined = pd.concat([det[cols], b1[cols], b2[cols]], ignore_index=True)
+
+    # --- Single source of truth: bucket + match_flag ---
+    is_det = combined["technique"] == "DETERMINISTIC_SSN"
+    name_match_exact = (
+        combined["kelmar_name"].fillna("").str.strip().str.lower()
+        == combined["sok_name"].fillna("").str.strip().str.lower()
+    )
+
+    combined["bucket"] = np.select(
+        [
+            is_det & name_match_exact,
+            is_det & (combined["name_score"] >= AUTO_APPROVE_THRESHOLD),
+            is_det & (combined["name_score"] >= REVIEW_THRESHOLD),
+            is_det,
+            ~is_det & (combined["confidence_score"] >= AUTO_APPROVE_THRESHOLD),
+            ~is_det & (combined["confidence_score"] >= REVIEW_THRESHOLD),
+            ~is_det,
+        ],
+        [
+            "DET_AUTO_APPROVE",
+            "DET_REVIEW_MINOR",
+            "DET_REVIEW_MODERATE",
+            "DET_REVIEW_MISMATCH",
+            "FUZZY_AUTO_APPROVE",
+            "FUZZY_REVIEW",
+            "FUZZY_REJECT",
+        ],
+        default=None,
+    )
+
+    combined["match_flag"] = np.select(
+        [
+            combined["bucket"] == "DET_REVIEW_MISMATCH",
+            combined["bucket"].isin(["DET_REVIEW_MINOR", "DET_REVIEW_MODERATE"]),
+        ],
+        ["SSN_CONFLICT_DIFFERENT_IDENTITY", "SSN_MATCH_NAME_MISMATCH"],
+        default=None,
+    )
+
     combined = (
         combined.sort_values("confidence_score", ascending=False)
         .drop_duplicates(subset=["OwnerID", "PropertyID", "DLN"])
     )
 
-    null_buckets = combined["bucket"].isna().sum()
-    assert null_buckets == 0, f"❌ Found {null_buckets} null buckets!"
-
-    combined.to_gbq(REVIEW_TABLE, project_id=PROJECT_ID, if_exists="replace")
-    log.info("✅ Review table: %d rows, 0 null buckets → %s", len(combined), REVIEW_TABLE)
+    _write_to_bq(bq, combined, REVIEW_TABLE)
+    log.info("✅ Review table: %d rows → %s", len(combined), REVIEW_TABLE)
     log.info("  %s", combined["bucket"].value_counts().to_dict())
 
 
@@ -790,7 +825,13 @@ def publish_mpi_output(bq):
 
     bq.query(f"""
         CREATE OR REPLACE TABLE `{output_table}` AS
-        SELECT * FROM `{REVIEW_CAPPED_V2}`
+        SELECT
+            * EXCEPT (name_score, street_score, composite_score, confidence_score),
+            ROUND(name_score, 1)       AS name_score,
+            ROUND(street_score, 1)     AS street_score,
+            ROUND(composite_score, 1)  AS composite_score,
+            ROUND(confidence_score, 1) AS confidence_score
+        FROM `{REVIEW_CAPPED_V2}`
     """).result()
 
     count = bq.query(f"SELECT COUNT(*) AS n FROM `{output_table}`").to_dataframe()
