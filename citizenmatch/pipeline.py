@@ -830,22 +830,22 @@ def publish_mpi_output(bq):
     log.info("✅ BQ output: %s rows → %s", count["n"].iloc[0], MPI_OUTPUT_TABLE)
 
     # 2) GCS — dated copy (MDDYY format, never overwritten)
+    from google.cloud import storage
+
     now = datetime.utcnow()
     date_suffix = f"{now.month}{now.strftime('%d%y')}"
-    gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}"
-    gcs_uri = f"gs://{GCS_MPI_BUCKET}/{GCS_MPI_PATH}/{gcs_filename}/*.csv"
+    gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}.csv"
+    gcs_path = f"{GCS_MPI_PATH}/{gcs_filename}"
 
-    export_query = f"""
-        EXPORT DATA OPTIONS(
-          uri='{gcs_uri}',
-          format='CSV',
-          overwrite=false,
-          header=true
-        ) AS
-        SELECT * FROM `{MPI_OUTPUT_TABLE}`
-    """
-    bq.query(export_query).result()
-    log.info("✅ GCS output: %s", gcs_uri)
+    # Read the output table into a DataFrame and upload as single CSV
+    df = bq.query(f"SELECT * FROM `{MPI_OUTPUT_TABLE}`").to_dataframe()
+    csv_data = df.to_csv(index=False)
+
+    client = storage.Client(project=PROJECT_ID)
+    bucket = client.bucket(GCS_MPI_BUCKET)
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_string(csv_data, content_type="text/csv")
+    log.info("✅ GCS output: gs://%s/%s", GCS_MPI_BUCKET, gcs_path)
 
 
 # ===========================================================================

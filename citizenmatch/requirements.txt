@@ -9,3 +9,4 @@ pandas-gbq==0.24.0
 pyarrow==17.0.0
 rapidfuzz==3.10.0
 numpy==2.1.0
+google-cloud-storage==2.18.1
