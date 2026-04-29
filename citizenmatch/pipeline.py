@@ -976,7 +976,7 @@ def publish_mpi_output(bq):
     # 1) BigQuery — overwrite the single delivery table
     bq.query(f"""
         CREATE OR REPLACE TABLE `{MPI_OUTPUT_TABLE}` AS
-        SELECT * FROM `{REVIEW_CAPPED_V2}`
+        SELECT * EXCEPT(DLN) FROM `{REVIEW_CAPPED_V2}`
     """).result()
 
     count = bq.query(f"SELECT COUNT(*) AS n FROM `{MPI_OUTPUT_TABLE}`").to_dataframe()
