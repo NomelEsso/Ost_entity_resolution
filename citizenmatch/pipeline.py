@@ -832,8 +832,8 @@ def publish_mpi_output(bq):
     # 2) GCS — dated copy (MDDYY format, never overwritten)
     now = datetime.utcnow()
     date_suffix = f"{now.month}{now.strftime('%d%y')}"
-    gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}.csv"
-    gcs_uri = f"gs://{GCS_MPI_BUCKET}/{GCS_MPI_PATH}/{gcs_filename}"
+    gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}"
+    gcs_uri = f"gs://{GCS_MPI_BUCKET}/{GCS_MPI_PATH}/{gcs_filename}/*.csv"
 
     export_query = f"""
         EXPORT DATA OPTIONS(
