@@ -37,6 +37,8 @@ from config import (
     REVIEW_CAPPED_V1, REVIEW_CAPPED_V2,
     UNMATCHED_TABLE,
     MPI_OUTPUT_PREFIX,
+    GCS_MPI_BUCKET,
+    GCS_MPI_PATH,
     BLOCK1_CONFIDENCE_CAP, BLOCK2_CONFIDENCE_CAP,
     AUTO_APPROVE_THRESHOLD, REVIEW_THRESHOLD,
     NAME_WEIGHT, STREET_WEIGHT,
@@ -806,10 +808,10 @@ def build_unmatched_table(bq):
 # ===========================================================================
 
 def publish_mpi_output(bq):
-    """Copy final capped results to citizen_mpi_result with dated table name.
+    """Publish final results to BigQuery and GCS.
 
-    Table name: OK_OST_OMES_Output_DataMatch_CCYYMMDD
-    Date is when the pipeline runs and produces the output.
+    BigQuery: OK_OST_OMES_OUTBOUND_DataMatch (overwritten each run)
+    GCS:      OK_OST_OMES_OUTBOUND_DataMatch_MDDYY.csv (new file each run, never overwritten)
     """
     log.info("Publishing MPI output...")
 
@@ -818,24 +820,32 @@ def publish_mpi_output(bq):
         log.info("No matches to publish — skipping MPI output")
         return
 
-    # Date the pipeline produces the output
-    land_date = datetime.utcnow().strftime("%Y%m%d")
-
-    output_table = f"{MPI_OUTPUT_PREFIX}_{land_date}"
-
+    # 1) BigQuery — overwrite the single delivery table
     bq.query(f"""
-        CREATE OR REPLACE TABLE `{output_table}` AS
-        SELECT
-            * EXCEPT (name_score, street_score, composite_score, confidence_score),
-            ROUND(name_score, 1)       AS name_score,
-            ROUND(street_score, 1)     AS street_score,
-            ROUND(composite_score, 1)  AS composite_score,
-            ROUND(confidence_score, 1) AS confidence_score
-        FROM `{REVIEW_CAPPED_V2}`
+        CREATE OR REPLACE TABLE `{MPI_OUTPUT_TABLE}` AS
+        SELECT * FROM `{REVIEW_CAPPED_V2}`
     """).result()
 
-    count = bq.query(f"SELECT COUNT(*) AS n FROM `{output_table}`").to_dataframe()
-    log.info("✅ MPI output: %s rows → %s", count["n"].iloc[0], output_table)
+    count = bq.query(f"SELECT COUNT(*) AS n FROM `{MPI_OUTPUT_TABLE}`").to_dataframe()
+    log.info("✅ BQ output: %s rows → %s", count["n"].iloc[0], MPI_OUTPUT_TABLE)
+
+    # 2) GCS — dated copy (MDDYY format, never overwritten)
+    now = datetime.utcnow()
+    date_suffix = f"{now.month}{now.strftime('%d%y')}"
+    gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}.csv"
+    gcs_uri = f"gs://{GCS_MPI_BUCKET}/{GCS_MPI_PATH}/{gcs_filename}"
+
+    export_query = f"""
+        EXPORT DATA OPTIONS(
+          uri='{gcs_uri}',
+          format='CSV',
+          overwrite=false,
+          header=true
+        ) AS
+        SELECT * FROM `{MPI_OUTPUT_TABLE}`
+    """
+    bq.query(export_query).result()
+    log.info("✅ GCS output: %s", gcs_uri)
 
 
 # ===========================================================================
