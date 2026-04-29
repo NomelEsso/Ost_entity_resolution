@@ -20,10 +20,14 @@ DLP_TEMPLATE_NAME = (
 )
 DLP_BATCH_SIZE = 200
 MAX_RETRIES    = 6
-BQ_CHUNK_ROWS  = 10000
+BQ_CHUNK_ROWS  = 100_000
 
-# Test mode: limit SOK rows processed (0 = no limit, use all rows)
-SOK_MAX_ROWS = int(os.environ.get("SOK_MAX_ROWS", "10000"))
+# SOK rows per trigger during initial load (Mode 1)
+# 1M rows ≈ 45 minutes of DLP processing — fits within Cloud Run 1hr timeout
+# Set to 0 via env var to remove limit (only if running outside Cloud Run)
+# Mode 2 (incremental) ignores this — processes new dates regardless
+SOK_MAX_ROWS = int(os.environ.get("SOK_MAX_ROWS", "1000000"))
+
 SOK_STAGING    = f"{PROJECT_ID}.{STAGING_DATASET}.boost_staging"
 KELMAR_STAGING = f"{PROJECT_ID}.{STAGING_DATASET}.OK_OST_OMES_DataMatch"
 

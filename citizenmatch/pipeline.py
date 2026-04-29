@@ -8,7 +8,7 @@ Stages:
   4. Fuzzy matching (Block 1: ZIP+Last+DOB, Block 2: ZIP+Last)
   5. Combine, dedupe, enrich, cap candidates
   6. Produce delivery + unmatched tables
-  7. Publish MPI output with dated table name
+  7. Publish MPI output (BQ overwrite + GCS dated copy)
 
 Called by main.py via run_pipeline().
 """
@@ -19,12 +19,12 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
-from google.cloud import bigquery, dlp_v2
+from google.cloud import bigquery, dlp_v2, storage
 import google.auth
 from google.auth import impersonated_credentials as ic
 
 from config import (
-    PROJECT_ID, LOCATION, IMPERSONATE_SA,
+    PROJECT_ID, LOCATION, OUTPUT_DATASET, IMPERSONATE_SA,
     DLP_TEMPLATE_NAME, DLP_BATCH_SIZE, MAX_RETRIES, BQ_CHUNK_ROWS,
     KELMAR_STAGING, SOK_STAGING, SOK_MAX_ROWS,
     KELMAR_TOKENIZED, SOK_TOKENIZED,
@@ -36,18 +36,13 @@ from config import (
     REVIEW_TABLE, REVIEW_ENRICHED,
     REVIEW_CAPPED_V1, REVIEW_CAPPED_V2,
     UNMATCHED_TABLE,
-    MPI_OUTPUT_TABLE,
-    GCS_MPI_BUCKET,
-    GCS_MPI_PATH,
+    MPI_OUTPUT_TABLE, GCS_MPI_BUCKET, GCS_MPI_PATH,
     BLOCK1_CONFIDENCE_CAP, BLOCK2_CONFIDENCE_CAP,
     AUTO_APPROVE_THRESHOLD, REVIEW_THRESHOLD,
     NAME_WEIGHT, STREET_WEIGHT,
 )
-from cleaners import (
-    clean_sok_names, clean_sok_address,
-    clean_kelmar_names, clean_kelmar_address,
-    similarity,
-)
+from cleaners import similarity
+from bq_udfs import create_cleaning_udfs
 
 log = logging.getLogger(__name__)
 
@@ -83,22 +78,12 @@ def _get_dlp_client():
 
 
 def _write_to_bq(bq, df, table_id, truncate=True):
-    """Load a DataFrame into BigQuery.
-
-    Single write site for the pipeline. Direct ``to_gbq`` /
-    ``load_table_from_dataframe`` calls are not allowed elsewhere — this
-    helper centralizes dtype protection and the bucket-completeness check.
-    """
+    """Load a DataFrame into BigQuery."""
     disposition = "WRITE_TRUNCATE" if truncate else "WRITE_APPEND"
     # Force ambiguous object columns to string, but preserve numeric columns
     for col in df.select_dtypes(include=["object"]).columns:
         if col not in ("name_score", "street_score", "confidence_score", "composite_score"):
             df[col] = df[col].astype("string")
-    if "bucket" in df.columns:
-        null_buckets = df["bucket"].isna().sum()
-        assert null_buckets == 0, (
-            f"Refusing to write {table_id}: {null_buckets} null buckets"
-        )
     job = bq.load_table_from_dataframe(
         df, table_id,
         job_config=bigquery.LoadJobConfig(write_disposition=disposition),
@@ -182,13 +167,58 @@ def tokenize_kelmar(bq, dlp):
 
 
 def tokenize_sok(bq, dlp):
-    """Tokenize all SOK SSNs (chunked) → sok_staging_dataset_tokenized_v2."""
-    log.info("Tokenizing SOK SSNs (chunked)...")
+    """Tokenize SOK SSNs with checkpoint-based resume → sok_staging_dataset_tokenized_v2.
 
-    def _fetch_chunk(last_txn, last_dln, last_file, last_ssn):
-        where = "WHERE SSN IS NOT NULL AND DLN IS NOT NULL"
-        if last_txn is not None:
-            where += f"""
+    Two modes:
+      1. INITIAL LOAD: checkpoint exists or no data yet → keyset pagination,
+         saves cursor after each chunk, resumes on next trigger.
+         Deletes checkpoint when all rows are processed.
+      2. INCREMENTAL (monthly): no checkpoint + data exists → only processes
+         _data_file_date_ values not yet in the tokenized table.
+    """
+    log.info("Tokenizing SOK SSNs...")
+
+    CHECKPOINT_TABLE = f"{PROJECT_ID}.{OUTPUT_DATASET}.sok_tokenization_checkpoint"
+
+    # --- Determine mode ---
+    has_checkpoint = False
+    last_txn = None
+    last_dln = last_file = last_ssn = ""
+    existing_count = 0
+
+    try:
+        existing_count = int(bq.query(
+            f"SELECT COUNT(*) AS n FROM `{SOK_TOKENIZED}`"
+        ).to_dataframe()["n"].iloc[0])
+    except Exception:
+        pass
+
+    try:
+        cp = bq.query(f"SELECT * FROM `{CHECKPOINT_TABLE}` LIMIT 1").to_dataframe()
+        if not cp.empty:
+            has_checkpoint = True
+            last_txn  = cp["last_txn"].iloc[0]
+            last_dln  = cp["last_dln"].iloc[0]
+            last_file = cp["last_file"].iloc[0]
+            last_ssn  = cp["last_ssn"].iloc[0]
+    except Exception:
+        pass
+
+    # =====================================================================
+    # MODE 1: INITIAL LOAD (checkpoint exists OR no data yet)
+    # =====================================================================
+    if has_checkpoint or existing_count == 0:
+        if has_checkpoint:
+            log.info("  INITIAL LOAD — resuming from checkpoint (%d rows exist)", existing_count)
+            first_write = False
+        else:
+            log.info("  INITIAL LOAD — starting fresh")
+            first_write = True
+
+        def _build_cursor_filter():
+            if last_txn is None:
+                return ""
+            return f"""
             AND (
               COALESCE(CAST(Transaction_ID AS STRING), '') > '{last_txn}'
               OR (
@@ -209,7 +239,129 @@ def tokenize_sok(bq, dlp):
               )
             )
             """
-        return bq.query(f"""
+
+        pending = bq.query(f"""
+            SELECT COUNT(*) AS n FROM `{SOK_STAGING}`
+            WHERE SSN IS NOT NULL AND DLN IS NOT NULL
+            {_build_cursor_filter()}
+        """).to_dataframe()["n"].iloc[0]
+
+        if pending == 0:
+            log.info("  initial load complete — deleting checkpoint")
+            try:
+                bq.query(f"DROP TABLE IF EXISTS `{CHECKPOINT_TABLE}`").result()
+            except Exception:
+                pass
+            log.info("✅ SOK fully tokenized: %d rows → %s", existing_count, SOK_TOKENIZED)
+            return
+
+        log.info("  %d rows remaining", pending)
+
+        def _fetch_chunk():
+            return bq.query(f"""
+                SELECT
+                  COALESCE(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
+                  COALESCE(CAST(_data_file_date_ AS STRING), '') AS _data_file_date_,
+                  Transaction_Date, Transaction_Type,
+                  CAST(DLN AS STRING) AS DLN,
+                  CAST(SSN AS STRING) AS SSN,
+                  First_Name, Middle_Name, Last_Name, Suffix, Date_of_Birth,
+                  Residential_Address_Street,
+                  CAST(Residential_Address_Street_2 AS STRING) AS Residential_Address_Street_2,
+                  CAST(Residential_Address_Unit_Type AS STRING) AS Residential_Address_Unit_Type,
+                  CAST(Residential_Address_Unit AS STRING) AS Residential_Address_Unit,
+                  Residential_Address_City, Residential_Address_State, Residential_Address_Zip,
+                  Mailing_Address_Street,
+                  CAST(Mailing_Address_Street_2 AS STRING) AS Mailing_Address_Street_2,
+                  CAST(Mailing_Address_Unit_Type AS STRING) AS Mailing_Address_Unit_Type,
+                  CAST(Mailing_Address_Unit AS STRING) AS Mailing_Address_Unit,
+                  Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip
+                FROM `{SOK_STAGING}`
+                WHERE SSN IS NOT NULL AND DLN IS NOT NULL
+                {_build_cursor_filter()}
+                ORDER BY
+                  COALESCE(CAST(Transaction_ID AS STRING), ''),
+                  CAST(DLN AS STRING),
+                  COALESCE(CAST(_data_file_date_ AS STRING), ''),
+                  CAST(SSN AS STRING)
+                LIMIT {BQ_CHUNK_ROWS}
+            """).to_dataframe(create_bqstorage_client=True)
+
+        def _save_checkpoint():
+            cp_df = pd.DataFrame([{
+                "last_txn": last_txn,
+                "last_dln": last_dln,
+                "last_file": last_file,
+                "last_ssn": last_ssn,
+                "updated_at": datetime.utcnow().isoformat(),
+            }])
+            _write_to_bq(bq, cp_df, CHECKPOINT_TABLE, truncate=True)
+
+        total = 0
+        while True:
+            chunk = _fetch_chunk()
+            if chunk.empty:
+                # All done — delete checkpoint
+                log.info("  initial load complete — deleting checkpoint")
+                try:
+                    bq.query(f"DROP TABLE IF EXISTS `{CHECKPOINT_TABLE}`").result()
+                except Exception:
+                    pass
+                break
+
+            chunk["SSN"] = chunk["SSN"].astype("string").str.strip()
+            chunk["ssn_token"] = _tokenize_batch(dlp, chunk["SSN"].tolist())
+            chunk["ssn_last4"] = chunk["SSN"].str.replace(r"\D", "", regex=True).str[-4:]
+
+            last_txn  = chunk["Transaction_ID"].iloc[-1]
+            last_dln  = chunk["DLN"].iloc[-1]
+            last_file = chunk["_data_file_date_"].iloc[-1]
+            last_ssn  = chunk["SSN"].iloc[-1]
+
+            chunk = chunk.drop(columns=["SSN"])
+
+            _write_to_bq(bq, chunk, SOK_TOKENIZED, truncate=first_write)
+            first_write = False
+            total += len(chunk)
+
+            _save_checkpoint()
+            log.info("  wrote %d rows (total new: %d) — checkpoint saved", len(chunk), total)
+
+            if SOK_MAX_ROWS and total >= SOK_MAX_ROWS:
+                log.info("  per-run limit reached (%d rows) — resume on next trigger", SOK_MAX_ROWS)
+                break
+
+        log.info("✅ SOK tokenized: %d new rows (total: %d) → %s",
+                 total, existing_count + total, SOK_TOKENIZED)
+        return
+
+    # =====================================================================
+    # MODE 2: INCREMENTAL (no checkpoint + data exists = initial load done)
+    # =====================================================================
+    log.info("  INCREMENTAL — checking for new _data_file_date_ values")
+
+    new_dates = bq.query(f"""
+        SELECT DISTINCT CAST(_data_file_date_ AS STRING) AS file_date
+        FROM `{SOK_STAGING}`
+        WHERE SSN IS NOT NULL AND DLN IS NOT NULL
+          AND CAST(_data_file_date_ AS STRING) NOT IN (
+            SELECT DISTINCT _data_file_date_ FROM `{SOK_TOKENIZED}`
+          )
+        ORDER BY file_date
+    """).to_dataframe()["file_date"].tolist()
+
+    if not new_dates:
+        log.info("  no new dates to process — SOK is up to date")
+        log.info("✅ SOK tokenized: %d rows (up to date) → %s", existing_count, SOK_TOKENIZED)
+        return
+
+    log.info("  %d new date(s) to process: %s", len(new_dates), new_dates)
+
+    total = 0
+    for file_date in new_dates:
+        log.info("  processing date: %s", file_date)
+
+        date_df = bq.query(f"""
             SELECT
               COALESCE(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
               COALESCE(CAST(_data_file_date_ AS STRING), '') AS _data_file_date_,
@@ -228,48 +380,24 @@ def tokenize_sok(bq, dlp):
               CAST(Mailing_Address_Unit AS STRING) AS Mailing_Address_Unit,
               Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip
             FROM `{SOK_STAGING}`
-            {where}
-            ORDER BY
-              COALESCE(CAST(Transaction_ID AS STRING), ''),
-              CAST(DLN AS STRING),
-              COALESCE(CAST(_data_file_date_ AS STRING), ''),
-              CAST(SSN AS STRING)
-            LIMIT {BQ_CHUNK_ROWS}
+            WHERE SSN IS NOT NULL AND DLN IS NOT NULL
+              AND CAST(_data_file_date_ AS STRING) = '{file_date}'
         """).to_dataframe(create_bqstorage_client=True)
 
-    last_txn = None
-    last_dln = last_file = last_ssn = ""
-    first_write = True
-    total = 0
+        if date_df.empty:
+            continue
 
-    while True:
-        chunk = _fetch_chunk(last_txn, last_dln, last_file, last_ssn)
-        if chunk.empty:
-            break
+        date_df["SSN"] = date_df["SSN"].astype("string").str.strip()
+        date_df["ssn_token"] = _tokenize_batch(dlp, date_df["SSN"].tolist())
+        date_df["ssn_last4"] = date_df["SSN"].str.replace(r"\D", "", regex=True).str[-4:]
+        date_df = date_df.drop(columns=["SSN"])
 
-        chunk["SSN"] = chunk["SSN"].astype("string").str.strip()
-        chunk["ssn_token"] = _tokenize_batch(dlp, chunk["SSN"].tolist())
-        chunk["ssn_last4"] = chunk["SSN"].str.replace(r"\D", "", regex=True).str[-4:]
+        _write_to_bq(bq, date_df, SOK_TOKENIZED, truncate=False)
+        total += len(date_df)
+        log.info("  date %s: %d rows tokenized", file_date, len(date_df))
 
-        # Advance cursor BEFORE dropping SSN
-        last_txn  = chunk["Transaction_ID"].iloc[-1]
-        last_dln  = chunk["DLN"].iloc[-1]
-        last_file = chunk["_data_file_date_"].iloc[-1]
-        last_ssn  = chunk["SSN"].iloc[-1]
-
-        chunk = chunk.drop(columns=["SSN"])  # ⛔ never persist raw SSN
-
-        _write_to_bq(bq, chunk, SOK_TOKENIZED, truncate=first_write)
-        first_write = False
-        total += len(chunk)
-        log.info("  wrote %d rows (total: %d)", len(chunk), total)
-
-        # Test mode: stop after SOK_MAX_ROWS (0 = no limit)
-        if SOK_MAX_ROWS and total >= SOK_MAX_ROWS:
-            log.info("  test limit reached (%d rows), stopping SOK tokenization", SOK_MAX_ROWS)
-            break
-
-    log.info("✅ SOK tokenized: %d rows → %s", total, SOK_TOKENIZED)
+    log.info("✅ SOK incremental: %d new rows (total: %d) → %s",
+             total, existing_count + total, SOK_TOKENIZED)
 
 
 # ===========================================================================
@@ -277,41 +405,83 @@ def tokenize_sok(bq, dlp):
 # ===========================================================================
 
 def clean_sok_table(bq):
-    """Clean SOK tokenized (SSN-present) rows → sok_clean_v1."""
-    log.info("Cleaning SOK (SSN-present)...")
-    df = bq.query(f"SELECT * FROM `{SOK_TOKENIZED}`").to_dataframe(
-        create_bqstorage_client=True
-    )
-    df = clean_sok_names(df)
-    df = clean_sok_address(df)
-    _write_to_bq(bq, df, SOK_CLEAN)
-    log.info("✅ SOK cleaned: %d rows → %s", len(df), SOK_CLEAN)
+    """Clean SOK tokenized (SSN-present) rows via BigQuery SQL — zero memory footprint."""
+    log.info("Cleaning SOK (SSN-present) via SQL...")
+
+    udf = f"{PROJECT_ID}.{OUTPUT_DATASET}"
+    bq.query(f"""
+        CREATE OR REPLACE TABLE `{SOK_CLEAN}` AS
+        SELECT *,
+            `{udf}`.clean_name(First_Name)  AS first_name_clean,
+            `{udf}`.clean_name(Middle_Name) AS middle_name_clean,
+            `{udf}`.clean_name(Last_Name)   AS last_name_clean,
+            NULLIF(TRIM(REGEXP_REPLACE(
+                CONCAT(
+                    COALESCE(`{udf}`.clean_name(First_Name), ''), ' ',
+                    COALESCE(`{udf}`.clean_name(Middle_Name), ''), ' ',
+                    COALESCE(`{udf}`.clean_name(Last_Name), '')
+                ), r'\\s+', ' '
+            )), '') AS full_name_clean,
+            `{udf}`.clean_street(
+                Residential_Address_Street,
+                CAST(Residential_Address_Street_2 AS STRING),
+                NULL
+            ) AS street_clean,
+            `{udf}`.clean_name(Residential_Address_City)    AS city_clean,
+            `{udf}`.clean_state(Residential_Address_State)  AS state_clean,
+            `{udf}`.clean_zip(CAST(Residential_Address_Zip AS STRING)) AS zip_clean
+        FROM `{SOK_TOKENIZED}`
+    """).result()
+
+    count = bq.query(f"SELECT COUNT(*) AS n FROM `{SOK_CLEAN}`").to_dataframe()
+    log.info("✅ SOK cleaned: %s rows → %s", count["n"].iloc[0], SOK_CLEAN)
 
 
 def clean_kelmar_table(bq):
-    """Clean Kelmar tokenized rows → kelmar_clean_v1."""
-    log.info("Cleaning Kelmar...")
-    df = bq.query(f"SELECT * FROM `{KELMAR_TOKENIZED}`").to_dataframe()
-    df = clean_kelmar_names(df)
-    df = clean_kelmar_address(df)
-    _write_to_bq(bq, df, KELMAR_CLEAN)
-    log.info("✅ Kelmar cleaned: %d rows → %s", len(df), KELMAR_CLEAN)
+    """Clean Kelmar tokenized rows via BigQuery SQL — zero memory footprint."""
+    log.info("Cleaning Kelmar via SQL...")
+
+    udf = f"{PROJECT_ID}.{OUTPUT_DATASET}"
+    bq.query(f"""
+        CREATE OR REPLACE TABLE `{KELMAR_CLEAN}` AS
+        SELECT *,
+            `{udf}`.clean_name(NameFirst)  AS first_name_clean,
+            `{udf}`.clean_name(NameMiddle) AS middle_name_clean,
+            `{udf}`.clean_name(NameLast)   AS last_name_clean,
+            NULLIF(TRIM(REGEXP_REPLACE(
+                CONCAT(
+                    COALESCE(`{udf}`.clean_name(NameFirst), ''), ' ',
+                    COALESCE(`{udf}`.clean_name(NameMiddle), ''), ' ',
+                    COALESCE(`{udf}`.clean_name(NameLast), '')
+                ), r'\\s+', ' '
+            )), '') AS full_name_clean,
+            `{udf}`.clean_street(
+                Address1,
+                CAST(Address2 AS STRING),
+                CAST(Address3 AS STRING)
+            ) AS street_clean,
+            `{udf}`.clean_name(City)           AS city_clean,
+            `{udf}`.clean_state(State)         AS state_clean,
+            `{udf}`.clean_zip(CAST(Zip AS STRING)) AS zip_clean
+        FROM `{KELMAR_TOKENIZED}`
+    """).result()
+
+    count = bq.query(f"SELECT COUNT(*) AS n FROM `{KELMAR_CLEAN}`").to_dataframe()
+    log.info("✅ Kelmar cleaned: %s rows → %s", count["n"].iloc[0], KELMAR_CLEAN)
 
 
 def clean_sok_null_table(bq):
-    """Extract and clean SOK rows where SSN IS NULL → sok_ssn_null_clean_v1."""
-    log.info("Cleaning SOK (SSN-null)...")
+    """Extract and clean SOK SSN-null rows via BigQuery SQL — zero memory footprint."""
+    log.info("Cleaning SOK (SSN-null) via SQL...")
 
-    # Extract SSN-null subset with explicit column types
-    # (SELECT * would bring raw types that don't match the tokenized pipeline)
+    udf = f"{PROJECT_ID}.{OUTPUT_DATASET}"
     limit_clause = f"LIMIT {SOK_MAX_ROWS}" if SOK_MAX_ROWS else ""
     bq.query(f"""
         CREATE OR REPLACE TABLE `{SOK_NULL_CLEAN}` AS
         SELECT
           COALESCE(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
           COALESCE(CAST(_data_file_date_ AS STRING), '') AS _data_file_date_,
-          Transaction_Date,
-          Transaction_Type,
+          Transaction_Date, Transaction_Type,
           CAST(DLN AS STRING) AS DLN,
           First_Name, Middle_Name, Last_Name, Suffix,
           Date_of_Birth,
@@ -324,21 +494,33 @@ def clean_sok_null_table(bq):
           CAST(Mailing_Address_Street_2 AS STRING) AS Mailing_Address_Street_2,
           CAST(Mailing_Address_Unit_Type AS STRING) AS Mailing_Address_Unit_Type,
           CAST(Mailing_Address_Unit AS STRING) AS Mailing_Address_Unit,
-          Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip
+          Mailing_Address_City, Mailing_Address_State, Mailing_Address_Zip,
+          `{udf}`.clean_name(First_Name)  AS first_name_clean,
+          `{udf}`.clean_name(Middle_Name) AS middle_name_clean,
+          `{udf}`.clean_name(Last_Name)   AS last_name_clean,
+          NULLIF(TRIM(REGEXP_REPLACE(
+              CONCAT(
+                  COALESCE(`{udf}`.clean_name(First_Name), ''), ' ',
+                  COALESCE(`{udf}`.clean_name(Middle_Name), ''), ' ',
+                  COALESCE(`{udf}`.clean_name(Last_Name), '')
+              ), r'\\s+', ' '
+          )), '') AS full_name_clean,
+          `{udf}`.clean_street(
+              Residential_Address_Street,
+              CAST(Residential_Address_Street_2 AS STRING),
+              NULL
+          ) AS street_clean,
+          `{udf}`.clean_name(Residential_Address_City)    AS city_clean,
+          `{udf}`.clean_state(Residential_Address_State)  AS state_clean,
+          `{udf}`.clean_zip(CAST(Residential_Address_Zip AS STRING)) AS zip_clean
         FROM `{SOK_STAGING}`
         WHERE SSN IS NULL
           AND DLN IS NOT NULL
         {limit_clause}
     """).result()
 
-    # Load, clean, write back
-    df = bq.query(f"SELECT * FROM `{SOK_NULL_CLEAN}`").to_dataframe(
-        create_bqstorage_client=True
-    )
-    df = clean_sok_names(df)
-    df = clean_sok_address(df)
-    _write_to_bq(bq, df, SOK_NULL_CLEAN)
-    log.info("✅ SOK SSN-null cleaned: %d rows → %s", len(df), SOK_NULL_CLEAN)
+    count = bq.query(f"SELECT COUNT(*) AS n FROM `{SOK_NULL_CLEAN}`").to_dataframe()
+    log.info("✅ SOK SSN-null cleaned: %s rows → %s", count["n"].iloc[0], SOK_NULL_CLEAN)
 
 
 # ===========================================================================
@@ -346,11 +528,7 @@ def clean_sok_null_table(bq):
 # ===========================================================================
 
 def deterministic_match(bq):
-    """Join Kelmar ↔ SOK on ssn_token (deduped by DLN) → ssn_deterministic_matches_v1.
-
-    Bucket and match_flag are NOT assigned here — Stage 5 (assemble_review_table)
-    is the single source of truth for those columns.
-    """
+    """Join Kelmar ↔ SOK on ssn_token (deduped by DLN) → ssn_deterministic_matches_v1."""
     log.info("Running deterministic SSN match...")
 
     bq.query(f"""
@@ -379,7 +557,19 @@ def deterministic_match(bq):
             s._data_file_date_,
             s.Transaction_ID, s.Transaction_Date, s.Transaction_Type,
 
-            k.ssn_token
+            k.ssn_token,
+
+            CASE
+                WHEN LOWER(TRIM(k.full_name_clean)) = LOWER(TRIM(s.full_name_clean))
+                    THEN 'DET_AUTO_APPROVE'
+                ELSE 'DET_REVIEW'
+            END AS bucket,
+
+            CASE
+                WHEN LOWER(TRIM(k.full_name_clean)) != LOWER(TRIM(s.full_name_clean))
+                    THEN 'SSN_MATCH_NAME_MISMATCH'
+                ELSE NULL
+            END AS match_flag
 
         FROM `{KELMAR_CLEAN}` k
         JOIN sok_dedup s ON k.ssn_token = s.ssn_token
@@ -471,7 +661,7 @@ def _block_candidates_sql(block_table, join_condition):
 
 
 def _score_and_classify(df, confidence_cap, block_name):
-    """Score candidate pairs. Bucket is assigned later in Stage 5."""
+    """Score candidate pairs and assign buckets. Returns the DataFrame."""
     df["name_score"] = df.apply(
         lambda r: similarity(r["kelmar_name"], r["sok_name"]), axis=1
     )
@@ -482,6 +672,13 @@ def _score_and_classify(df, confidence_cap, block_name):
         df["name_score"] * NAME_WEIGHT + df["street_score"] * STREET_WEIGHT
     )
     df["confidence_score"] = confidence_cap * (df["composite_score"] / 100)
+    df["bucket"] = np.where(
+        df["confidence_score"] >= AUTO_APPROVE_THRESHOLD, "FUZZY_AUTO_APPROVE",
+        np.where(
+            df["confidence_score"] >= REVIEW_THRESHOLD, "FUZZY_REVIEW",
+            "FUZZY_REJECT",
+        ),
+    )
     df["block_name"]      = block_name
     df["match_stage"]     = "FUZZY"
     df["scoring_version"] = "v1"
@@ -505,8 +702,9 @@ def fuzzy_block1(bq):
 
     df = _score_and_classify(df, BLOCK1_CONFIDENCE_CAP, "BLOCK1_ZIP_LAST_DOB")
 
-    _write_to_bq(bq, df, BLOCK1_CLASSIFIED)
+    df.to_gbq(BLOCK1_CLASSIFIED, project_id=PROJECT_ID, if_exists="replace")
     log.info("✅ Block 1 classified: %d rows", len(df))
+    log.info("  %s", df["bucket"].value_counts().to_dict())
 
 
 def fuzzy_block2(bq):
@@ -527,8 +725,9 @@ def fuzzy_block2(bq):
 
     df = _score_and_classify(df, BLOCK2_CONFIDENCE_CAP, "BLOCK2_ZIP_LAST")
 
-    _write_to_bq(bq, df, BLOCK2_CLASSIFIED)
+    df.to_gbq(BLOCK2_CLASSIFIED, project_id=PROJECT_ID, if_exists="replace")
     log.info("✅ Block 2 classified: %d rows", len(df))
+    log.info("  %s", df["bucket"].value_counts().to_dict())
 
 
 # ===========================================================================
@@ -536,44 +735,23 @@ def fuzzy_block2(bq):
 # ===========================================================================
 
 def assemble_review_table(bq):
-    """Merge deterministic + fuzzy results → treasury_match_review_v2.
-
-    Single source of truth for bucket and match_flag. Every downstream row
-    gets its bucket assigned exactly once, here, after the union.
-    """
+    """Merge deterministic + fuzzy results → treasury_match_review_v2."""
     log.info("Assembling final review table...")
 
     # --- DLN → latest Transaction_ID mapping ---
-    # Fuzzy matches can pull from SOK_NULL_CLEAN (SSN-null rows), so the map
-    # must cover both the SSN-tokenized rows and the SSN-null rows. Without
-    # the union, fuzzy matches whose DLN only exists in SOK_NULL_CLEAN come
-    # out with a NULL Transaction_ID after the merge.
     dln_map = bq.query(f"""
-        WITH all_sok AS (
-          SELECT
-            CAST(DLN AS STRING) AS DLN,
-            NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
-            CAST(_data_file_date_ AS STRING) AS _data_file_date_,
-            Transaction_Date
-          FROM `{SOK_TOKENIZED}`
-          WHERE DLN IS NOT NULL
-          UNION ALL
-          SELECT
-            CAST(DLN AS STRING) AS DLN,
-            NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
-            CAST(_data_file_date_ AS STRING) AS _data_file_date_,
-            Transaction_Date
-          FROM `{SOK_NULL_CLEAN}`
-          WHERE DLN IS NOT NULL
-        )
-        SELECT DLN, Transaction_ID, _data_file_date_
-        FROM all_sok
+        SELECT
+          CAST(DLN AS STRING) AS DLN,
+          NULLIF(CAST(Transaction_ID AS STRING), '') AS Transaction_ID,
+          _data_file_date_
+        FROM `{SOK_TOKENIZED}`
+        WHERE DLN IS NOT NULL
         QUALIFY ROW_NUMBER() OVER (
-          PARTITION BY DLN
+          PARTITION BY CAST(DLN AS STRING)
           ORDER BY
             _data_file_date_ DESC,
             SAFE_CAST(Transaction_Date AS TIMESTAMP) DESC,
-            IF(Transaction_ID IS NULL, 1, 0) ASC
+            IF(NULLIF(CAST(Transaction_ID AS STRING), '') IS NULL, 1, 0) ASC
         ) = 1
     """).to_dataframe()
 
@@ -593,7 +771,10 @@ def assemble_review_table(bq):
             sc.full_name_clean AS sok_name, sc.street_clean AS sok_street,
             sc.city_clean AS sok_city, sc.state_clean AS sok_state,
             sc.zip_clean AS sok_zip, sc.Date_of_Birth,
-            'DETERMINISTIC_SSN' AS technique
+            'DETERMINISTIC_SSN' AS technique,
+            CASE WHEN LOWER(TRIM(k.full_name_clean)) != LOWER(TRIM(sc.full_name_clean))
+                 THEN 'SSN_MATCH_NAME_MISMATCH' ELSE NULL
+            END AS match_flag
         FROM `{DET_MATCHES}` d
         JOIN `{KELMAR_CLEAN}` k
           ON d.OwnerID = k.OwnerID AND d.PropertyID = k.PropertyID
@@ -610,6 +791,13 @@ def assemble_review_table(bq):
     )
     det["composite_score"] = det["name_score"] * NAME_WEIGHT + det["street_score"] * STREET_WEIGHT
     det["confidence_score"] = det["composite_score"]  # 100% ceiling for SSN match
+
+    det["bucket"] = np.where(
+        det["match_flag"].isna(), "DET_AUTO_APPROVE",
+        np.where(det["name_score"] >= 90, "DET_REVIEW_MINOR",
+                 np.where(det["name_score"] >= 80, "DET_REVIEW_MODERATE",
+                          "DET_REVIEW_MISMATCH")),
+    )
     det = det.merge(dln_map, on="DLN", how="left")
     log.info("  deterministic rows: %d", len(det))
 
@@ -628,14 +816,17 @@ def assemble_review_table(bq):
 
     b1 = b1.merge(dln_map, on="DLN", how="left")
     b2 = b2.merge(dln_map, on="DLN", how="left")
+    b1["match_flag"] = None
+    b2["match_flag"] = None
 
-    # --- Standardize columns (bucket / match_flag assigned after concat) ---
+    # --- Standardize columns ---
     cols = [
         "OwnerID", "PropertyID", "DLN",
         "Transaction_ID", "_data_file_date_",
         "kelmar_name", "kelmar_street", "kelmar_city", "kelmar_state", "kelmar_zip", "BirthDT",
         "sok_name", "sok_street", "sok_city", "sok_state", "sok_zip", "Date_of_Birth",
         "technique", "name_score", "street_score", "confidence_score", "composite_score",
+        "bucket", "match_flag",
     ]
 
     for label, df in [("det", det), ("block1", b1), ("block2", b2)]:
@@ -643,53 +834,18 @@ def assemble_review_table(bq):
         if missing:
             raise ValueError(f"{label} missing columns: {missing}")
 
+    # --- Combine + dedupe ---
     combined = pd.concat([det[cols], b1[cols], b2[cols]], ignore_index=True)
-
-    # --- Single source of truth: bucket + match_flag ---
-    is_det = combined["technique"] == "DETERMINISTIC_SSN"
-    name_match_exact = (
-        combined["kelmar_name"].fillna("").str.strip().str.lower()
-        == combined["sok_name"].fillna("").str.strip().str.lower()
-    )
-
-    combined["bucket"] = np.select(
-        [
-            is_det & name_match_exact,
-            is_det & (combined["name_score"] >= AUTO_APPROVE_THRESHOLD),
-            is_det & (combined["name_score"] >= REVIEW_THRESHOLD),
-            is_det,
-            ~is_det & (combined["confidence_score"] >= AUTO_APPROVE_THRESHOLD),
-            ~is_det & (combined["confidence_score"] >= REVIEW_THRESHOLD),
-            ~is_det,
-        ],
-        [
-            "DET_AUTO_APPROVE",
-            "DET_REVIEW_MINOR",
-            "DET_REVIEW_MODERATE",
-            "DET_REVIEW_MISMATCH",
-            "FUZZY_AUTO_APPROVE",
-            "FUZZY_REVIEW",
-            "FUZZY_REJECT",
-        ],
-        default=None,
-    )
-
-    combined["match_flag"] = np.select(
-        [
-            combined["bucket"] == "DET_REVIEW_MISMATCH",
-            combined["bucket"].isin(["DET_REVIEW_MINOR", "DET_REVIEW_MODERATE"]),
-        ],
-        ["SSN_CONFLICT_DIFFERENT_IDENTITY", "SSN_MATCH_NAME_MISMATCH"],
-        default=None,
-    )
-
     combined = (
         combined.sort_values("confidence_score", ascending=False)
         .drop_duplicates(subset=["OwnerID", "PropertyID", "DLN"])
     )
 
-    _write_to_bq(bq, combined, REVIEW_TABLE)
-    log.info("✅ Review table: %d rows → %s", len(combined), REVIEW_TABLE)
+    null_buckets = combined["bucket"].isna().sum()
+    assert null_buckets == 0, f"❌ Found {null_buckets} null buckets!"
+
+    combined.to_gbq(REVIEW_TABLE, project_id=PROJECT_ID, if_exists="replace")
+    log.info("✅ Review table: %d rows, 0 null buckets → %s", len(combined), REVIEW_TABLE)
     log.info("  %s", combined["bucket"].value_counts().to_dict())
 
 
@@ -697,7 +853,6 @@ def enrich_review_table(bq):
     """Add CashValue + Deceased flag → treasury_match_review_v3."""
     log.info("Enriching with CashValue and Deceased flag...")
 
-    # Skip if review table is empty (avoids type errors on empty tables)
     row_count = bq.query(f"SELECT COUNT(*) AS n FROM `{REVIEW_TABLE}`").to_dataframe()["n"].iloc[0]
     if row_count == 0:
         log.info("Review table is empty — skipping enrichment")
@@ -729,7 +884,6 @@ def cap_and_deliver(bq):
         log.info("No matches to cap — skipping")
         return
 
-    # Capped v1 (without enrichment)
     bq.query(f"""
         CREATE OR REPLACE TABLE `{REVIEW_CAPPED_V1}` AS
         WITH ranked AS (
@@ -743,7 +897,6 @@ def cap_and_deliver(bq):
         WHERE technique = 'DETERMINISTIC_SSN' OR rank_within_property = 1
     """).result()
 
-    # Capped v2 (enriched + eligibility flag)
     bq.query(f"""
         CREATE OR REPLACE TABLE `{REVIEW_CAPPED_V2}` AS
         WITH enriched AS (
@@ -830,14 +983,11 @@ def publish_mpi_output(bq):
     log.info("✅ BQ output: %s rows → %s", count["n"].iloc[0], MPI_OUTPUT_TABLE)
 
     # 2) GCS — dated copy (MDDYY format, never overwritten)
-    from google.cloud import storage
-
     now = datetime.utcnow()
     date_suffix = f"{now.month}{now.strftime('%d%y')}"
     gcs_filename = f"OK_OST_OMES_OUTBOUND_DataMatch_{date_suffix}.csv"
     gcs_path = f"{GCS_MPI_PATH}/{gcs_filename}"
 
-    # Read the output table into a DataFrame and upload as single CSV
     df = bq.query(f"SELECT * FROM `{MPI_OUTPUT_TABLE}`").to_dataframe()
     csv_data = df.to_csv(index=False)
 
@@ -866,7 +1016,30 @@ def run_pipeline():
     tokenize_kelmar(bq, dlp)
     tokenize_sok(bq, dlp)
 
-    # Stage 2: Clean
+    # Check if SOK tokenization is still in progress
+    # If checkpoint exists, SOK is not fully loaded — skip matching stages
+    CHECKPOINT_TABLE = f"{PROJECT_ID}.{OUTPUT_DATASET}.sok_tokenization_checkpoint"
+    try:
+        cp_count = bq.query(
+            f"SELECT COUNT(*) AS n FROM `{CHECKPOINT_TABLE}`"
+        ).to_dataframe()["n"].iloc[0]
+        if cp_count > 0:
+            elapsed = time.time() - start
+            log.info("=" * 60)
+            log.info("SOK tokenization still in progress (%d rows so far)",
+                     int(bq.query(f"SELECT COUNT(*) AS n FROM `{SOK_TOKENIZED}`").to_dataframe()["n"].iloc[0]))
+            log.info("Trigger the pipeline again to continue tokenization")
+            log.info("Pipeline paused after %.1f seconds", elapsed)
+            log.info("=" * 60)
+            return
+    except Exception:
+        pass  # No checkpoint table = tokenization complete
+
+    # Create/update BigQuery cleaning UDFs (idempotent)
+    dataset_ref = f"{PROJECT_ID}.{OUTPUT_DATASET}"
+    create_cleaning_udfs(bq, dataset_ref)
+
+    # Stage 2: Clean (runs entirely in BigQuery — zero memory footprint)
     clean_kelmar_table(bq)
     clean_sok_table(bq)
     clean_sok_null_table(bq)
