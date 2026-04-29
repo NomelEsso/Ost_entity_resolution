@@ -20,10 +20,10 @@ DLP_TEMPLATE_NAME = (
 )
 DLP_BATCH_SIZE = 200
 MAX_RETRIES    = 6
-BQ_CHUNK_ROWS  = 500
+BQ_CHUNK_ROWS  = 10000
 
 # Test mode: limit SOK rows processed (0 = no limit, use all rows)
-SOK_MAX_ROWS = int(os.environ.get("SOK_MAX_ROWS", "500"))
+SOK_MAX_ROWS = int(os.environ.get("SOK_MAX_ROWS", "10000"))
 SOK_STAGING    = f"{PROJECT_ID}.{STAGING_DATASET}.boost_staging"
 KELMAR_STAGING = f"{PROJECT_ID}.{STAGING_DATASET}.OK_OST_OMES_DataMatch"
 
