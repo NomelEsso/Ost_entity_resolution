@@ -694,7 +694,7 @@ def fuzzy_block1(bq):
         BLOCK1_CANDIDATES,
         "k.zip_clean = s.zip_clean "
         "AND k.last_name_clean = s.last_name_clean "
-        "AND CAST(k.BirthDT AS STRING) = CAST(s.Date_of_Birth AS STRING)",
+        "AND SAFE.PARSE_DATE('%m/%d/%Y', k.BirthDT) = s.Date_of_Birth",
     )).result()
 
     df = bq.query(f"SELECT * FROM `{BLOCK1_CANDIDATES}`").to_dataframe()
