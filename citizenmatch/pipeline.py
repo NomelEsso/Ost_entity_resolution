@@ -694,7 +694,7 @@ def fuzzy_block1(bq):
         BLOCK1_CANDIDATES,
         "k.zip_clean = s.zip_clean "
         "AND k.last_name_clean = s.last_name_clean "
-        "AND k.BirthDT = s.Date_of_Birth",
+        "AND CAST(k.BirthDT AS STRING) = CAST(s.Date_of_Birth AS STRING)",
     )).result()
 
     df = bq.query(f"SELECT * FROM `{BLOCK1_CANDIDATES}`").to_dataframe()
@@ -777,7 +777,8 @@ def assemble_review_table(bq):
             END AS match_flag
         FROM `{DET_MATCHES}` d
         JOIN `{KELMAR_CLEAN}` k
-          ON d.OwnerID = k.OwnerID AND d.PropertyID = k.PropertyID
+          ON CAST(d.OwnerID AS INT64) = CAST(k.OwnerID AS INT64)
+         AND CAST(d.PropertyID AS INT64) = CAST(k.PropertyID AS INT64)
         JOIN sok_latest sc
           ON CAST(d.DLN AS STRING) = CAST(sc.DLN AS STRING) AND sc.rn = 1
     """).to_dataframe()
@@ -948,7 +949,8 @@ def build_unmatched_table(bq):
             k.BirthDT
         FROM `{KELMAR_CLEAN}` k
         LEFT JOIN `{REVIEW_TABLE}` r
-          ON k.OwnerID = r.OwnerID AND k.PropertyID = r.PropertyID
+          ON CAST(k.OwnerID AS INT64) = CAST(r.OwnerID AS INT64)
+         AND CAST(k.PropertyID AS INT64) = CAST(r.PropertyID AS INT64)
         WHERE r.OwnerID IS NULL
     """).result()
 
