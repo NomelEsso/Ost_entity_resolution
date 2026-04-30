@@ -48,7 +48,7 @@ default_args = {
 # DAG
 # ---------------------------------------------------------------------------
 with DAG(
-    dag_id="citizenmatch_trigger",
+    dag_id="citizenmatch_pipeline",
     description="Ingest Kelmar → tokenize SOK → match → deliver (fully automated)",
     start_date=datetime(2025, 1, 1),
     schedule_interval=None,          # manual for testing — "0 7 1 * *" for monthly
