@@ -40,8 +40,8 @@ MAX_ITERATIONS = 10  # Safety limit: 10 * 1M rows = 10M (more than enough for 6.
 # ---------------------------------------------------------------------------
 default_args = {
     "owner": "Nomel",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retries": 3,
+    "retry_delay": timedelta(minutes=2),
 }
 
 # ---------------------------------------------------------------------------
@@ -76,7 +76,8 @@ with DAG(
           - If checkpoint exists → returns success, we call again
           - If no checkpoint → runs full matching pipeline, we're done
 
-        The final iteration runs: clean → match → score → output.
+        Handles ReadTimeout gracefully — Cloud Run saves checkpoints
+        regardless, so a dropped connection is not a failure.
         """
         hook = BigQueryHook(
             gcp_conn_id="google_cloud_default",
@@ -86,22 +87,32 @@ with DAG(
         for i in range(1, MAX_ITERATIONS + 1):
             print(f"--- Iteration {i}/{MAX_ITERATIONS} ---")
 
-            # Call Cloud Run
+            # Call Cloud Run — handle timeout gracefully
             token = id_token.fetch_id_token(Request(), CLOUD_RUN_URL)
-            resp = requests.post(
-                CLOUD_RUN_URL,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=3600,  # 1 hour max per call
-            )
-
-            print(f"Status: {resp.status_code}")
-            print(f"Response: {resp.text}")
-
-            if resp.status_code != 200:
-                raise RuntimeError(
-                    f"Pipeline failed on iteration {i}: "
-                    f"{resp.status_code} — {resp.text}"
+            try:
+                resp = requests.post(
+                    CLOUD_RUN_URL,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=3600,
                 )
+                print(f"Status: {resp.status_code}")
+                print(f"Response: {resp.text}")
+
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Pipeline failed on iteration {i}: "
+                        f"{resp.status_code} — {resp.text}"
+                    )
+
+            except requests.exceptions.ReadTimeout:
+                print(f"Read timeout on iteration {i} — Cloud Run likely "
+                      f"still processing. Checking checkpoint...")
+            except requests.exceptions.ConnectionError:
+                print(f"Connection error on iteration {i} — checking checkpoint...")
+
+            # Wait briefly for Cloud Run to finish writing checkpoint
+            import time
+            time.sleep(30)
 
             # Check if SOK tokenization is still in progress
             try:
