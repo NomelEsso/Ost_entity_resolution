@@ -220,4 +220,12 @@ with DAG(
         execution_timeout=timedelta(hours=12),
     )
 
-    trigger_ingestion >> run_pipeline
+    # Step 3: Trigger audit/historical log pipeline
+    trigger_audit = TriggerDagRunOperator(
+        task_id="trigger_audit_pipeline",
+        trigger_dag_id="kelmar_outbound",
+        wait_for_completion=False,  # don't wait — audit is independent
+        execution_timeout=timedelta(minutes=5),
+    )
+
+    trigger_ingestion >> run_pipeline >> trigger_audit
