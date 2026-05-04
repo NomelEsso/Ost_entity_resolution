@@ -77,6 +77,7 @@ with DAG(
         hook = BigQueryHook(
             gcp_conn_id="google_cloud_default",
             use_legacy_sql=False,
+            location="us-central1",
         )
 
         def _bq_count(sql):
