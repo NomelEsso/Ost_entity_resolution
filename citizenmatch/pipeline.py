@@ -799,6 +799,8 @@ def assemble_review_table(bq):
                  np.where(det["name_score"] >= 80, "DET_REVIEW_MODERATE",
                           "DET_REVIEW_MISMATCH")),
     )
+    # Distinguish different-identity cases from name variations
+    det.loc[det["bucket"] == "DET_REVIEW_MISMATCH", "match_flag"] = "SSN_CONFLICT_DIFFERENT_IDENTITY"
     det = det.merge(dln_map, on="DLN", how="left")
     log.info("  deterministic rows: %d", len(det))
 

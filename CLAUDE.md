@@ -207,7 +207,7 @@ SOK candidate pool = `SOK_NULL_CLEAN` ∪ (SSN-present clean rows not in `DET_MA
 
 ## Bucket assignment logic (single source of truth)
 
-**This logic runs exactly once, in the combine step (Stage 5).** No intermediate table carries a competing `bucket` column.
+**Deterministic buckets** are assigned in `assemble_review_table` (Stage 5). **Fuzzy buckets** are assigned in `_score_and_classify` (Stage 4) and carried through unchanged. No intermediate table carries a competing deterministic `bucket` column.
 
 **Deterministic SSN matches:**
 
