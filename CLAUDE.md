@@ -6,7 +6,7 @@ Context for Claude Code. Read this before touching anything.
 
 ## What this project does
 
-Matches Kelmar unclaimed-property records against Oklahoma citizen records (SOK) to produce a confidence-bucketed review file for Treasury. Output tells Treasury which citizen most likely owns each unclaimed property, with cash value and deceased-flag enrichment.
+Matches ~5,000 Kelmar unclaimed-property records against ~6.5M Oklahoma citizen records (SOK/BOOST) to produce a confidence-bucketed review file for Treasury. Output tells Treasury which citizen most likely owns each unclaimed property, with cash value and deceased-flag enrichment.
 
 ---
 
@@ -14,14 +14,17 @@ Matches Kelmar unclaimed-property records against Oklahoma citizen records (SOK)
 
 - **Cloud:** GCP
 - **Project (default):** `aw-ost-property-np` (overridable via `PROJECT_ID` env var)
-- **Region:** `us-central1`
-- **Datasets** (all in the same project):
-  - `citizen_staging` — raw inbound tables from MoveIt
-  - `citizen_match` — working tables (tokenized, cleaned, match candidates, review)
-  - `citizen_mpi_result` — final dated MPI output delivered to Kelmar
-- **Compute:** Vertex AI Jupyter (dev), Cloud Run + Composer + Dataproc (prod)
-- **Tokenization:** Cloud DLP deterministic deidentify template
+- **Region / dataset location:** `us-central1`
+- **Datasets** (all in the same project, all in `us-central1`):
+  - `citizen_staging` — raw inbound tables (Kelmar from DE's DAG, SOK live view)
+  - `citizen_match` — working tables (tokenized, cleaned, match candidates, review, checkpoint)
+  - `citizen_mpi_result` — final MPI output delivered to Kelmar
+- **Compute:** Cloud Run (production pipeline), Cloud Composer (orchestration)
+- **Tokenization:** Cloud DLP deterministic deidentify template (template ID `4648784086040580254`)
+- **KMS:** Keyring `citizenmatch-keyring`, key `citizenmatch-dlp-key` (us-central1)
 - **Fuzzy lib:** `rapidfuzz` (`fuzz.WRatio`)
+- **Service account:** `svc-omes-data-property-np@aw-ost-property-np.iam.gserviceaccount.com`
+- **Composer environment:** `composer-ost-dev` (us-central1)
 
 ---
 
@@ -31,38 +34,54 @@ Matches Kelmar unclaimed-property records against Oklahoma citizen records (SOK)
 .
 ├── citizenmatch/                  # Python package — runs inside Cloud Run
 │   ├── config.py                  # Single source of truth: project, datasets, tables, thresholds
-│   ├── cleaners.py                # Name/address/state/zip/street normalizers (shared by Kelmar + SOK)
+│   ├── cleaners.py                # Python name/address normalizers (used for local tests + fuzzy scoring)
+│   ├── bq_udfs.py                 # BigQuery JavaScript UDFs for cleaning (production — zero memory)
 │   ├── pipeline.py                # Pipeline stages: tokenize → clean → deterministic → fuzzy → combine → cap → deliver
 │   ├── main.py                    # Cloud Run HTTP entry point — invokes pipeline.py
 │   ├── test_cleaners.py           # Unit tests for cleaners.py
-│   ├── Dockerfile                 # Cloud Run container build
-│   └── requirements.txt           # Python deps for the container
+│   ├── Dockerfile                 # Cloud Run container build (gunicorn, 1hr timeout, single worker)
+│   └── requirements.txt           # Python deps (includes google-cloud-storage for GCS export)
 ├── composer/                      # Airflow DAGs running in Cloud Composer
-│   ├── composer_cloud_run.py      # DAG `citizenmatch_trigger` — POSTs to Cloud Run, blocking
-│   └── composer_dataproc.py       # DAG — Dataproc cluster lifecycle for heavier load step
-├── docs/
-│   └── code_review.md
+│   ├── composer_cloud_run.py      # DAG `citizenmatch_pipeline` — orchestrates full pipeline
+│   └── composer_dataproc.py       # DAG — Dataproc cluster lifecycle (legacy, not actively used)
 ├── notebooks/                     # Vertex AI dev notebooks (exploratory; not deployed)
 ├── README.md
 └── CLAUDE.md                      # This file
 ```
 
 **Working rules tied to layout:**
-- Anything in `citizenmatch/` runs inside the Cloud Run container. Keep it import-clean and free of notebook idioms (no `!pip install`, no `display()`, no shell magic).
-- **Whenever `cleaners.py` changes, run `test_cleaners.py`** before considering the change done. Cleaner drift silently kills match rates.
+- Anything in `citizenmatch/` runs inside the Cloud Run container. Keep it import-clean and free of notebook idioms.
+- **Production cleaning uses `bq_udfs.py`** (BigQuery JavaScript UDFs). `cleaners.py` is kept for local tests and for the `similarity()` function used in fuzzy scoring. The JS UDFs must produce identical output to the Python cleaners — any drift silently kills match rates.
 - New constants, table names, or thresholds go in `config.py`. Never inline.
 - New pipeline stages go in `pipeline.py` and are called from `main.py`. Don't add HTTP handling logic outside `main.py`.
-- Notebooks under `notebooks/` are exploration-only — do not import from them, and do not treat their logic as canonical. The package code in `citizenmatch/` is the source of truth.
-- DAGs in `composer/` should not contain business logic. They orchestrate; the work lives in Cloud Run / Dataproc.
+- Notebooks under `notebooks/` are exploration-only — do not import from them.
+- DAGs in `composer/` should not contain business logic. They orchestrate; the work lives in Cloud Run.
+
+---
+
+## Source data
+
+**Kelmar:** `aw-ost-property-np.citizen_staging.OK_OST_OMES_DataMatch`
+- ~5,000 rows per batch. Truncated and reloaded each month by the DE's DAG (`gcs_to_bq_unclaimed_property_ingestion`).
+- `BirthDT` is STRING in `MM/DD/YYYY` format.
+- `OwnerID` and `PropertyID` are INT64.
+
+**SOK:** `aw-ost-property-np.citizen_staging.boost_staging`
+- Live view from `aw-fti-d360-p.boost_dailyload_prod.ab_sok_boost`. ~6.65M rows total.
+- ~5.89M rows have SSN (tokenized), ~766K have SSN NULL (fuzzy only).
+- `Date_of_Birth` is DATE type.
+- `_data_file_date_` is DATE — set when data is uploaded to GCP (not a transaction date). Used as the incremental marker for SOK tokenization.
+- `Transaction_ID` is NULL for ~96% of rows. This is source data, not a bug.
+- Distribution: 72 distinct `_data_file_date_` values, largest single date has 4M rows.
 
 ---
 
 ## Hard security rules — DO NOT VIOLATE
 
 1. **Never read, print, log, or persist raw SSNs.** Only `ssn_token` (DLP output) and `ssn_last4` are allowed downstream.
-2. **Never write raw PII into notebook cell outputs.** Clear outputs before commit.
-3. **Never hardcode credentials, project IDs, or DLP template resource names in source files.** Always import from `citizenmatch/config.py`.
-4. **Never echo file contents that may contain SSN columns** (e.g. `head` on raw staging exports). To inspect format, use a helper that returns metadata only (length, has_dash, all_digits) — never the value.
+2. **Never include DLN in MPI output.** DLN is PII. The `publish_mpi_output` function uses `SELECT * EXCEPT(DLN)`.
+3. **Never write raw PII into notebook cell outputs.** Clear outputs before commit.
+4. **Never hardcode credentials, project IDs, or DLP template resource names in source files.** Always import from `citizenmatch/config.py`.
 5. **If you encounter raw PII in any file, stop and flag it.** Do not "work around" it.
 
 ---
@@ -82,27 +101,33 @@ All table names, project IDs, thresholds, and tuning constants live here. **Neve
 - `MPI_DATASET = "citizen_mpi_result"`
 
 **DLP**
-- `DLP_TEMPLATE_NAME` — built from `PROJECT_ID` + `LOCATION` + a fixed template ID. Updating the project automatically targets the right template path **only if a template with that ID exists in the new project.** Verify before assuming.
+- `DLP_TEMPLATE_NAME` — built from `PROJECT_ID` + `LOCATION` + template ID `4648784086040580254`
 - `DLP_BATCH_SIZE = 200`
 - `MAX_RETRIES = 6`
 
 **BigQuery batching**
-- `BQ_CHUNK_ROWS = 500` — much smaller than the dev notebook's 100,000. Production keeps memory low.
+- `BQ_CHUNK_ROWS = 100_000` — rows fetched per keyset pagination chunk during SOK tokenization
 
-**Test-mode footgun (READ THIS)**
-- `SOK_MAX_ROWS = 500` by default — limits SOK rows processed for fast iteration.
-- **A full run requires `SOK_MAX_ROWS=0`** (or any value larger than the table). Running with defaults will silently process only 500 SOK rows.
+**SOK tokenization limit**
+- `SOK_MAX_ROWS = 1_000_000` by default — limits SOK rows processed per Cloud Run trigger
+- This is NOT a total limit — the Composer DAG loops automatically until all rows are processed
+- 1M rows ≈ 12 minutes of DLP processing, fits within Cloud Run's 1-hour timeout
+- Set to 0 via env var to remove limit (only if running outside Cloud Run)
 
 **Tables (working dataset `citizen_match`)**
 - Staging in: `SOK_STAGING = citizen_staging.boost_staging`, `KELMAR_STAGING = citizen_staging.OK_OST_OMES_DataMatch`
 - Tokenized: `KELMAR_TOKENIZED`, `SOK_TOKENIZED`
-- Cleaned: `KELMAR_CLEAN`, `SOK_CLEAN`, `SOK_NULL_CLEAN` (separate table for SSN-null SOK rows)
+- Cleaned: `KELMAR_CLEAN`, `SOK_CLEAN`, `SOK_NULL_CLEAN`
 - Fuzzy intermediates: `KELMAR_UNMATCHED`, `KELMAR_FUZZY`, `FUZZY_POOL`, `BLOCK1_CANDIDATES`, `BLOCK2_CANDIDATES`, `BLOCK1_CLASSIFIED`, `BLOCK2_CLASSIFIED`
 - Deterministic: `DET_MATCHES`
-- Review tables: `REVIEW_TABLE` (v2), `REVIEW_ENRICHED` (v3), `REVIEW_CAPPED_V1`, `REVIEW_CAPPED_V2`, `UNMATCHED_TABLE`
+- Review tables: `REVIEW_TABLE`, `REVIEW_ENRICHED`, `REVIEW_CAPPED_V1`, `REVIEW_CAPPED_V2`, `UNMATCHED_TABLE`
+- Checkpoint: `sok_tokenization_checkpoint` (temporary, deleted when initial load completes)
 
-**Final delivery (dataset `citizen_mpi_result`)**
-- `MPI_OUTPUT_PREFIX = ...citizen_mpi_result.OK_OST_OMES_Output_DataMatch` — **a date suffix is appended at runtime.** Do not write to the prefix directly.
+**Final delivery**
+- `MPI_OUTPUT_TABLE = ...citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch` — overwritten each run, DLN excluded
+- `GCS_MPI_BUCKET = "kelmar_outbound_files"` — GCS bucket for dated copies
+- `GCS_MPI_PATH = "kelmar_mpi_files"` — folder inside bucket
+- GCS filename: `OK_OST_OMES_OUTBOUND_DataMatch_MDDYY.csv` — new file each run, never overwritten. Date is when the **pipeline runs** (`datetime.utcnow()`), not when the data was loaded.
 
 **Tuning constants — use these, do not redefine**
 - `BLOCK1_CONFIDENCE_CAP = 95`
@@ -117,56 +142,74 @@ All table names, project IDs, thresholds, and tuning constants live here. **Neve
 ## Pipeline stages
 
 ### 1. Tokenize
-- DLP deterministic template → same SSN always produces the same token.
-- Source: `SOK_STAGING`, `KELMAR_STAGING`. Output: `SOK_TOKENIZED`, `KELMAR_TOKENIZED`.
-- Raw `SSN` column is **dropped** before the tokenized table is written.
-- Batch size = `DLP_BATCH_SIZE`, exponential backoff on 429 / `ResourceExhausted`.
 
-### 2. Clean
-- Identical cleaners on Kelmar, SOK, and SOK-null paths.
-- **Names** (`clean_name`): accent-strip → upper → drop titles (`MR`, `MRS`, `DR`, `PROF`, `REV`, `JUDGE`, etc.) → strip non-name punctuation → collapse whitespace.
-- **Street** (`clean_street`): accent-strip → upper → normalize PO Box variants (`P.O. BOX`, `PO Box` → `PO BOX`) → collapse `APARTMENT`/`APT` to `APT` and `SUITE`/`STE` to `STE` → rewrite `#X` as `APT X` → standardize directionals (`NORTH` → `N`) and street types (`STREET` → `ST`) → strip remaining punctuation → collapse whitespace. **Titles are NOT dropped from streets** — street names commonly contain title-shaped tokens (`DR MARTIN LUTHER KING BLVD`, `JUDGE HARRIS PKWY`) and stripping them would corrupt the address.
-- **State** (`clean_state`): accent-strip → upper → keep first 2 letters only.
-- **Zip** (`clean_zip`): keep first 5 digits only.
-- Outputs: `KELMAR_CLEAN`, `SOK_CLEAN`, `SOK_NULL_CLEAN`.
+**Kelmar:** All rows tokenized in one batch (small table, ~5K rows).
+
+**SOK:** Two modes, handled automatically:
+
+**Mode 1 — INITIAL LOAD** (checkpoint exists OR no tokenized data):
+- Keyset pagination through all SSN-present rows, ordered by `(Transaction_ID, DLN, _data_file_date_, SSN)`
+- Processes up to `SOK_MAX_ROWS` (1M) per Cloud Run trigger
+- Saves cursor position to `sok_tokenization_checkpoint` table after every 100K chunk
+- When all rows processed → deletes checkpoint
+- Composer DAG loops automatically: calls Cloud Run → checks checkpoint → calls again
+
+**Mode 2 — INCREMENTAL** (no checkpoint + tokenized data exists):
+- Finds `_data_file_date_` values in source NOT in tokenized table
+- Processes each new date as a batch
+- Used for monthly runs after initial load is complete
+
+Raw `SSN` column is **dropped** before writing to tokenized table. Exponential backoff on 429 / `ResourceExhausted`.
+
+### 2. Clean (BigQuery SQL — zero memory)
+
+Production cleaning runs entirely in BigQuery via JavaScript UDFs (`bq_udfs.py`). **No data moves to Cloud Run memory.**
+
+UDFs are created/updated at the start of each run (idempotent) in the `citizen_match` dataset:
+- `clean_name(val STRING)` → accent-strip → upper → drop titles → strip punctuation → collapse whitespace
+- `clean_street(val1 STRING, val2 STRING, val3 STRING)` → PO BOX normalize → APT/STE → directionals → street types → collapse whitespace
+- `clean_state(val STRING)` → first 2 uppercase letters
+- `clean_zip(val STRING)` → first 5 digits
+
+Three SQL `CREATE TABLE AS SELECT` statements clean Kelmar, SOK (SSN-present), and SOK (SSN-null) with zero memory footprint.
 
 ### 3. Deterministic match
-- `JOIN ON k.ssn_token = s.ssn_token`.
-- Output: `DET_MATCHES`. **No `bucket` or `match_flag` column on this table** — those are assigned in Stage 5.
-- Confidence is computed as `100 * composite_score / 100` for deterministic rows.
+- `JOIN ON k.ssn_token = s.ssn_token` (SOK deduped by DLN via `ROW_NUMBER()`)
+- Output: `DET_MATCHES`
 
 ### 4. Fuzzy match
-Built only against Kelmar rows that did not match deterministically (`KELMAR_UNMATCHED` → `KELMAR_FUZZY`).
+Built only against Kelmar rows that did not match deterministically.
 SOK candidate pool = `SOK_NULL_CLEAN` ∪ (SSN-present clean rows not in `DET_MATCHES`) → `FUZZY_POOL`.
 
-**Block 1 — ZIP + Last + DOB** (output `BLOCK1_CLASSIFIED`)
-- `confidence_score = BLOCK1_CONFIDENCE_CAP * composite_score / 100`
+**Block 1 — ZIP + Last + DOB:**
+- Join condition uses `SAFE.PARSE_DATE('%m/%d/%Y', k.BirthDT) = s.Date_of_Birth` (Kelmar BirthDT is STRING `MM/DD/YYYY`, SOK Date_of_Birth is DATE)
+- `confidence_score = 95 * composite_score / 100`
+- CAN produce `FUZZY_AUTO_APPROVE`
 
-**Block 2 — ZIP + Last only** (output `BLOCK2_CLASSIFIED`)
-- `confidence_score = BLOCK2_CONFIDENCE_CAP * composite_score / 100`
-- **Cannot produce `FUZZY_AUTO_APPROVE` by design** — cap (85) < auto-approve threshold (90).
+**Block 2 — ZIP + Last only:**
+- `confidence_score = 85 * composite_score / 100`
+- **Cannot produce `FUZZY_AUTO_APPROVE` by design** — cap (85) < threshold (90)
 
-**Composite score (both blocks):**
-```
-composite_score = NAME_WEIGHT * name_score + STREET_WEIGHT * street_score
-```
-where `name_score` and `street_score` are `rapidfuzz.fuzz.WRatio(...)`.
+**Composite score:** `NAME_WEIGHT * name_score + STREET_WEIGHT * street_score` where scores are `rapidfuzz.fuzz.WRatio(...)`.
 
 ### 5. Combine + cap + enrich + bucket assignment
-- Union deterministic + Block 1 + Block 2 → `REVIEW_TABLE`.
-- **Bucket and `match_flag` are assigned here, in one place, for every row.** See the bucket logic block below.
-- Enrich with `CashValue` (Kelmar) and `Deceased` (SOK staging) → `REVIEW_ENRICHED`.
-- Cap to one candidate per `(OwnerID, PropertyID)` using `ROW_NUMBER()` ordered by `confidence_score DESC` → `REVIEW_CAPPED_V2`. Deterministic rows are always kept regardless of rank.
-- Add `Eligibility_Flag` column (see Eligibility section below).
-- Final delivery: dated table under `MPI_OUTPUT_PREFIX` in `citizen_mpi_result`. Scores rounded to 1 decimal.
+- Union deterministic + Block 1 + Block 2 → `REVIEW_TABLE`
+- Bucket and `match_flag` assigned in one place (see Bucket Logic section)
+- Enrich with `CashValue` (Kelmar) and `Deceased` (SOK staging) → `REVIEW_ENRICHED`
+- Cap to one fuzzy candidate per `(OwnerID, PropertyID)` via `ROW_NUMBER()`. Deterministic rows always kept.
+- Add `Eligibility_Flag` → `REVIEW_CAPPED_V2`
+
+### 6. Publish MPI output
+- **BigQuery:** `citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch` — overwritten each run, DLN excluded, scores rounded to 1 decimal
+- **GCS:** `gs://kelmar_outbound_files/kelmar_mpi_files/OK_OST_OMES_OUTBOUND_DataMatch_MDDYY.csv` — permanent dated copy, uploaded as single CSV via `google.cloud.storage`
 
 ---
 
 ## Bucket assignment logic (single source of truth)
 
-Every match is assigned a confidence bucket that determines its workflow: auto-approve, review, or reject. **This logic runs exactly once, in the combine step (Stage 5), against the unioned `REVIEW_TABLE`.** No intermediate table (`DET_MATCHES`, `BLOCK1_CLASSIFIED`, `BLOCK2_CLASSIFIED`) carries a competing `bucket` column.
+**This logic runs exactly once, in the combine step (Stage 5).** No intermediate table carries a competing `bucket` column.
 
-**Deterministic SSN matches.** The SSN confirms identity, so the bucket depends on whether the names also agree (since the SSN is the same on both sides):
+**Deterministic SSN matches:**
 
 | Name agreement | bucket | match_flag |
 |---|---|---|
@@ -175,9 +218,7 @@ Every match is assigned a confidence bucket that determines its workflow: auto-a
 | `name_score >= 80` | `DET_REVIEW_MODERATE` | `SSN_MATCH_NAME_MISMATCH` |
 | `name_score < 80` | `DET_REVIEW_MISMATCH` | `SSN_CONFLICT_DIFFERENT_IDENTITY` |
 
-The 3-state `match_flag` lets Treasury filter "slight name variation" vs. "completely different identity that happens to share an SSN token" (an upstream data-quality signal, not a pipeline bug).
-
-**Fuzzy matches.** No SSN confirmation, so the bucket is driven by `confidence_score`:
+**Fuzzy matches:**
 
 | Condition | bucket |
 |---|---|
@@ -185,99 +226,175 @@ The 3-state `match_flag` lets Treasury filter "slight name variation" vs. "compl
 | `confidence_score >= 80` | `FUZZY_REVIEW` |
 | `confidence_score < 80` | `FUZZY_REJECT` |
 
-Fuzzy rows leave `match_flag = NULL`.
-
-**Implementation rules:**
-- Use `AUTO_APPROVE_THRESHOLD` (90) and `REVIEW_THRESHOLD` (80) from `config.py`. Never hardcode.
-- Block 2 cannot reach `FUZZY_AUTO_APPROVE` because its confidence cap (85) is below the auto-approve threshold (90). This is by design.
-- After assignment, `assert combined["bucket"].isna().sum() == 0` before writing to BigQuery.
-
 ---
 
-## Eligibility flag (delivered to Kelmar)
-
-`Eligibility_Flag` is a delivered column on the final MPI output. It tells Treasury / Kelmar whether a matched citizen is eligible to receive their unclaimed property.
+## Eligibility flag
 
 | Condition | Eligibility_Flag |
 |---|---|
 | `Deceased = TRUE` | `INELIGIBLE_DECEASED` |
 | Otherwise | `ELIGIBLE` |
 
-Set in Stage 5 alongside the cap step (when `REVIEW_CAPPED_V2` is built).
+---
 
-**Today this is the only ineligibility reason.** If new rules are added later (minors, missing fields, etc.), add them as additional `INELIGIBLE_<REASON>` values — keep the `ELIGIBLE` / `INELIGIBLE_*` naming convention so existing Treasury filters keep working.
+## Production architecture
+
+```
+Monthly schedule (or manual ▶)
+    │
+    ├─ Task 1: trigger_kelmar_ingestion
+    │   └─ Triggers DE's DAG (gcs_to_bq_unclaimed_property_ingestion)
+    │   └─ DE picks latest Kelmar CSV from GCS → truncates & loads OK_OST_OMES_DataMatch
+    │
+    ├─ Task 2: tokenize_and_match (auto-loop)
+    │   ├─ Call Cloud Run → tokenize Kelmar + 1M SOK → checkpoint saved → 200 OK
+    │   │   └─ Check checkpoint → exists → call again
+    │   ├─ Call Cloud Run → resume → 1M more SOK → checkpoint saved
+    │   │   └─ Check checkpoint → exists → call again
+    │   ├─ ...
+    │   └─ Call Cloud Run → finishes SOK → deletes checkpoint → clean → match → output
+    │       └─ Check checkpoint → gone, output exists → ✅ DONE
+    │
+    └─ Task 3: trigger_audit_pipeline
+        └─ Triggers DE's audit DAG (kelmar_outbound) — independent, fire-and-forget
+```
+
+**Cloud Run:**
+- URL: `https://citizenmatch-pipeline-s3dq7cyrzq-uc.a.run.app`
+- Memory: 8Gi, CPU: 4, Timeout: 3600s
+- Service account: `svc-omes-data-property-np@aw-ost-property-np.iam.gserviceaccount.com`
+
+**Cloud Run deploy command:**
+```bash
+cd ~/Ost_entity_resolution/citizenmatch
+gcloud builds submit --tag gcr.io/aw-ost-property-np/citizenmatch-pipeline .
+gcloud run deploy citizenmatch-pipeline \
+  --image gcr.io/aw-ost-property-np/citizenmatch-pipeline \
+  --region us-central1 \
+  --project aw-ost-property-np \
+  --service-account svc-omes-data-property-np@aw-ost-property-np.iam.gserviceaccount.com \
+  --no-allow-unauthenticated \
+  --timeout 3600 \
+  --memory 8Gi \
+  --cpu 4
+```
+
+**Composer:**
+- Environment: `composer-ost-dev` (us-central1)
+- DAG ID: `citizenmatch_pipeline`
+- DAG file: `gs://us-central1-composer-ost-de-78128a51-bucket/dags/citizenmatch_pipeline.py`
+- Schedule: `None` (manual) — change to `"0 7 1 * *"` for monthly production
+- `execution_timeout`: 12 hours (covers full initial load)
+
+**DAG upload command:**
+```bash
+cd ~/Ost_entity_resolution
+gsutil cp composer/composer_cloud_run.py gs://us-central1-composer-ost-de-78128a51-bucket/dags/citizenmatch_pipeline.py
+```
+
+**GitHub:** `https://github.com/NomelEsso/Ost_entity_resolution.git` (private)
+
+**Deploy workflow:**
+1. Edit in VS Code → commit → push to GitHub
+2. Cloud Shell: `cd ~/Ost_entity_resolution && git pull`
+3. Build + deploy Cloud Run (commands above)
+4. Upload DAG to Composer (command above)
+5. Trigger: Airflow UI → citizenmatch_pipeline → ▶
 
 ---
 
-## Schemas (key columns)
+## Known pitfalls (paid for in debug time — don't reintroduce)
 
-**Kelmar (`KELMAR_CLEAN`):** `OwnerID`, `PropertyID`, `NameLast`, `NameFirst`, `NameMiddle`, `Address1/2/3`, `City`, `State`, `Zip`, `BirthDT`, `CashValue`, `ssn_token`, `ssn_last4`, plus cleaned: `first_name_clean`, `middle_name_clean`, `last_name_clean`, `full_name_clean`, `street_clean`, `city_clean`, `state_clean`, `zip_clean`.
-
-**SOK (`SOK_CLEAN`, `SOK_NULL_CLEAN`):** `DLN`, `Transaction_ID`, `_data_file_date_`, `Transaction_Date`, `Transaction_Type`, `First_Name`, `Middle_Name`, `Last_Name`, `Suffix`, `Date_of_Birth`, `Residential_Address_*`, `Mailing_Address_*`, `ssn_token` (null in null-clean table), plus the same `*_clean` fields as Kelmar. Note: these schemas come from the dev notebook against the old staging tables — **verify column names against `citizen_staging.boost_staging` and `citizen_staging.OK_OST_OMES_DataMatch` before writing new code; the new staging tables may differ.**
-
-**Final review (`REVIEW_ENRICHED` / `REVIEW_CAPPED_V2`):** `OwnerID`, `PropertyID`, `DLN`, `Transaction_ID`, `_data_file_date_`, `kelmar_name/street/city/state/zip`, `BirthDT`, `sok_name/street/city/state/zip`, `Date_of_Birth`, `technique`, `name_score`, `street_score`, `composite_score`, `confidence_score`, `bucket`, `match_flag`, `CashValue`, `Deceased`, `Eligibility_Flag` (added in `REVIEW_CAPPED_V2`).
+1. **Silent null buckets from `.map()` rename.** Always assert `combined["bucket"].isna().sum() == 0` before writing to BigQuery.
+2. **SOK fan-out on DLN joins.** Fix: `ROW_NUMBER() OVER (PARTITION BY DLN ORDER BY _data_file_date_ DESC NULLS LAST) = 1`.
+3. **Capping must partition on `(OwnerID, PropertyID)`, not just `OwnerID`.** Cap is `= 1`.
+4. **`DET_AUTO_APPROVE` can show lower confidence than `DET_REVIEW_*` rows.** Expected, not a bug.
+5. **Block 2 will never auto-approve.** By design.
+6. **`Transaction_ID` can be NULL.** Use `COALESCE(CAST(Transaction_ID AS STRING), '')` in keyset pagination.
+7. **BirthDT vs Date_of_Birth type mismatch.** Kelmar `BirthDT` is STRING (`MM/DD/YYYY`), SOK `Date_of_Birth` is DATE. Join must use `SAFE.PARSE_DATE('%m/%d/%Y', k.BirthDT) = s.Date_of_Birth`.
+8. **Pyarrow type inference.** Columns with mostly NULLs get inferred as INT64. `_write_to_bq` forces object columns to string (except score columns which stay numeric).
+9. **BigQuery Hook location.** Composer's BigQueryHook must specify `location="us-central1"` or it cannot find tables. Without this, all `_bq_count` queries silently return 0.
+10. **Cloud Run terminates containers with no active requests.** Fire-and-forget HTTP calls do NOT work. The Composer DAG must keep the connection alive (`timeout=3600`).
+11. **HTTP response drops between Composer and Cloud Run.** ReadTimeout is caught and handled — DAG checks BigQuery for progress, then retries.
+12. **GCS export as folder.** BigQuery `EXPORT DATA` creates sharded folders. Use Python `storage.Client` to upload a single clean CSV instead.
+13. **SOK_MAX_ROWS = 1M is the safe per-trigger limit.** 6.5M rows in one trigger exceeds Cloud Run's 1-hour timeout. The DAG auto-loops.
 
 ---
 
-## Known pitfalls (already paid for in debug time — don't reintroduce)
+## Clean slate command (delete all pipeline tables before test run)
 
-1. **Silent null buckets from `.map()` rename.** A previous version remapped fuzzy bucket labels using unprefixed keys against already-prefixed values, silently nulling all fuzzy buckets. **Always assert `combined["bucket"].isna().sum() == 0` before writing to BigQuery.**
-2. **SOK fan-out on DLN joins.** SOK has multiple historical rows per DLN. Joining directly multiplies rows. Fix: `ROW_NUMBER() OVER (PARTITION BY DLN ORDER BY _data_file_date_ DESC NULLS LAST) = 1`. For fuzzy validation, union with `SOK_NULL_CLEAN` since fuzzy can pull from there.
-3. **Capping must partition on `(OwnerID, PropertyID)`, not just `OwnerID`.** Each property gets its own best candidate. Cap is `= 1`.
-4. **`DET_AUTO_APPROVE` can show lower confidence than `DET_REVIEW_*` rows.** Confidence includes street score; bucket assignment does not. Expected, not a bug.
-5. **Block 2 will never auto-approve.** Confidence cap of 85 < threshold of 90. By design.
-6. **`Transaction_ID` can be NULL.** Use `COALESCE(CAST(Transaction_ID AS STRING), '')` in keyset pagination so rows are not skipped.
-7. **`SOK_MAX_ROWS = 500` test default.** A "successful" run in dev may only have processed 500 rows. Always confirm `SOK_MAX_ROWS` before claiming a full run.
+```bash
+bq rm -f aw-ost-property-np:citizen_match.sok_staging_dataset_tokenized_v2
+bq rm -f aw-ost-property-np:citizen_match.sok_tokenization_checkpoint
+bq rm -f aw-ost-property-np:citizen_match.kelmar_staging_dataset_tokenized_v1
+bq rm -f aw-ost-property-np:citizen_match.kelmar_clean_v1
+bq rm -f aw-ost-property-np:citizen_match.sok_clean_v1
+bq rm -f aw-ost-property-np:citizen_match.sok_ssn_null_clean_v1
+bq rm -f aw-ost-property-np:citizen_match.ssn_deterministic_matches_v1
+bq rm -f aw-ost-property-np:citizen_match.kelmar_unmatched_v1
+bq rm -f aw-ost-property-np:citizen_match.kelmar_fuzzy_v1
+bq rm -f aw-ost-property-np:citizen_match.sok_fuzzy_pool_v1
+bq rm -f aw-ost-property-np:citizen_match.fuzzy_block1_candidates_v1
+bq rm -f aw-ost-property-np:citizen_match.fuzzy_block2_candidates_v1
+bq rm -f aw-ost-property-np:citizen_match.fuzzy_block1_classified_v1
+bq rm -f aw-ost-property-np:citizen_match.fuzzy_block2_classified_v1
+bq rm -f aw-ost-property-np:citizen_match.treasury_match_review_v2
+bq rm -f aw-ost-property-np:citizen_match.treasury_match_review_v3
+bq rm -f aw-ost-property-np:citizen_match.treasury_match_review_capped_v1
+bq rm -f aw-ost-property-np:citizen_match.treasury_match_review_capped_v2
+bq rm -f aw-ost-property-np:citizen_match.treasury_unmatched_v1
+bq rm -f aw-ost-property-np:citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch
+```
+
+---
+
+## Validation queries
+
+```bash
+# Row counts
+bq query --project_id=aw-ost-property-np --nouse_legacy_sql \
+  "SELECT 'kelmar_clean' AS tbl, COUNT(*) AS cnt FROM \`aw-ost-property-np.citizen_match.kelmar_clean_v1\`
+   UNION ALL SELECT 'sok_tokenized', COUNT(*) FROM \`aw-ost-property-np.citizen_match.sok_staging_dataset_tokenized_v2\`
+   UNION ALL SELECT 'det_matches', COUNT(*) FROM \`aw-ost-property-np.citizen_match.ssn_deterministic_matches_v1\`
+   UNION ALL SELECT 'review_table', COUNT(*) FROM \`aw-ost-property-np.citizen_match.treasury_match_review_v2\`
+   UNION ALL SELECT 'unmatched', COUNT(*) FROM \`aw-ost-property-np.citizen_match.treasury_unmatched_v1\`
+   UNION ALL SELECT 'mpi_output', COUNT(*) FROM \`aw-ost-property-np.citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch\`"
+
+# Bucket distribution
+bq query --project_id=aw-ost-property-np --nouse_legacy_sql \
+  "SELECT bucket, COUNT(*) AS cnt FROM \`aw-ost-property-np.citizen_match.treasury_match_review_v2\` GROUP BY bucket ORDER BY cnt DESC"
+
+# Join validation (should be 0 mismatches)
+bq query --project_id=aw-ost-property-np --nouse_legacy_sql \
+  "SELECT COUNTIF(k.OwnerID IS NULL) AS kelmar_not_found, COUNTIF(t.kelmar_name != k.full_name_clean) AS name_mismatch, COUNT(*) AS total
+   FROM \`aw-ost-property-np.citizen_match.treasury_match_review_v2\` t
+   LEFT JOIN \`aw-ost-property-np.citizen_match.kelmar_clean_v1\` k
+     ON CAST(t.OwnerID AS INT64) = k.OwnerID AND CAST(t.PropertyID AS INT64) = k.PropertyID"
+```
+
+---
+
+## Latest test results (5,000 Kelmar × 5.89M SOK)
+
+- **4,570 matched (91.4%)**, 430 unmatched (8.6%)
+- DET_AUTO_APPROVE: 539, DET_REVIEW_MINOR: 1,358, DET_REVIEW_MODERATE: 1,638
+- DET_REVIEW_MISMATCH: 267, FUZZY_AUTO_APPROVE: 9, FUZZY_REVIEW: 150, FUZZY_REJECT: 24,211
+- Join validation: 0 mismatches, 0 missing records
+- BirthDT nulls (90%) and Transaction_ID nulls (96%) confirmed as source data, not join errors
 
 ---
 
 ## Mandatory guardrails for any code change
 
-- Cleaners must remain **identical** between Kelmar, SOK, and SOK-null paths. If you change one, change all three. Drift here causes silent match loss.
-- **All BigQuery writes go through `_write_to_bq` in `pipeline.py`.** Direct `to_gbq` / `load_table_from_dataframe` calls are not allowed in new code. The helper centralizes dtype protection and the `null_buckets == 0` assertion — bypassing it means the next dtype fix or schema guard won't apply to your write site.
-- **Bucket and `match_flag` are assigned in exactly one place** — the combine step in `assemble_review_table`. No intermediate table (`DET_MATCHES`, `BLOCK1_CLASSIFIED`, `BLOCK2_CLASSIFIED`) carries a `bucket` column that competes with the final assignment. See the "Bucket assignment logic" section for the full rule.
-- Any new BigQuery write must `assert null_buckets == 0` (or equivalent for the column being validated).
-- Any new SOK join on DLN must use the latest-row pattern (`ROW_NUMBER() ... = 1`) unless you explicitly want full history.
-- Any DLP call must use `DLP_TEMPLATE_NAME` from config — never hardcode a template resource name.
-- Any threshold or weight must be imported from config — never redefined inline.
-- Output table writes use `WRITE_TRUNCATE` only on versioned names (e.g. `_v3`). Never overwrite a delivered MPI output table.
-- New code must be project-portable: read `PROJECT_ID` from config (which reads env), don't hardcode `aw-ost-property-np` or the old dev project.
-
----
-
-## Productionization architecture (whiteboard)
-
-```
-OMES side:                                          OST side:
-  Composer DAG 1 (read GCS -> BQ staging)             MoveIt -> Storage
-       |                                                 ^
-       v                                                 |
-  citizen_staging tables                                 |
-       |                                                 |
-       v                                                 |
-  Cloud Run (cleaning + matching pipeline)               |
-       |                                                 |
-       v                                                 |
-  citizen_match working tables                           |
-       |                                                 |
-       v                                                 |
-  citizen_mpi_result.OK_OST_OMES_Output_DataMatch_<date> |
-       |                                                 |
-       v                                                 |
-  Composer DAG 2 (BQ -> GCS) -----------> MoveIt --------+
-```
-
-- **Cloud Run deploy:** `gcloud functions deploy ... --gen2 --runtime python310 --no-allow-unauthenticated --timeout 3600s --memory 1gi`.
-- **Cloud Run URL:** `https://citizenmatch-pipeline-s3dq7cyrzq-uc.a.run.app`
-- **Composer DAG 1** (`composer_cloud_run.py`, dag_id `citizenmatch_trigger`):
-  - Single `PythonOperator` task.
-  - Fetches an OIDC token via `id_token.fetch_id_token`, POSTs to Cloud Run with `Authorization: Bearer <token>`.
-  - **Blocking call** — waits up to 1 hour for the pipeline to finish (`requests.post(..., timeout=3600)`), task `execution_timeout` is 2 hours.
-  - Non-200 response raises `RuntimeError` and fails the task.
-  - `schedule_interval=None` (manual trigger). Monthly target is `"0 7 1 * *"` — flip when ready.
-  - No audit table, no sensor — the DAG trusts Cloud Run's HTTP response.
-- **Composer DAG 2** (`composer_dataproc.py`): Dataproc cluster create → PySpark job → cluster delete. Used for the heavier load step.
-- Features still to add: structured logging, archive table with batch numbers, feedback channel back to Kelmar.
+- **Cleaning parity:** BigQuery JS UDFs in `bq_udfs.py` must produce identical output to Python cleaners in `cleaners.py`. If you change one, change both.
+- **All BigQuery writes go through `_write_to_bq` in `pipeline.py`.** Forces object columns to string (except scores), centralizes write logic.
+- **Bucket and `match_flag` are assigned in exactly one place** — `assemble_review_table`.
+- Any new SOK join on DLN must use `ROW_NUMBER() ... = 1` unless you explicitly want full history.
+- Any DLP call must use `DLP_TEMPLATE_NAME` from config.
+- Any threshold or weight must be imported from config.
+- DLN must never appear in MPI output tables or GCS exports.
+- New code must be project-portable: read `PROJECT_ID` from config, don't hardcode.
+- Score columns (`name_score`, `street_score`, `confidence_score`, `composite_score`) are rounded to 1 decimal in MPI output only.
 
 ---
 
@@ -287,3 +404,13 @@ OMES side:                                          OST side:
 - Prefer complete, copy-paste-ready scripts over diffs.
 - Ad hoc SQL → write it for the BigQuery console, not wrapped in Python.
 - Keep written summaries tight and single-paragraph where possible.
+
+---
+
+## On the horizon
+
+- Switch DAG schedule from `None` to `"0 7 1 * *"` for monthly production
+- Move to production GCP project `aw-ost-property-p` when approved (create new DLP template, update `config.py`)
+- Structured logging
+- Archive tables with batch numbers
+- Feedback channel back to Kelmar
