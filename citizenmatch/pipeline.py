@@ -791,7 +791,7 @@ def assemble_review_table(bq):
         lambda r: similarity(r["kelmar_street"], r["sok_street"]), axis=1
     )
     det["composite_score"] = det["name_score"] * NAME_WEIGHT + det["street_score"] * STREET_WEIGHT
-    det["confidence_score"] = det["composite_score"]  # 100% ceiling for SSN match
+    det["confidence_score"] = det["name_score"].astype(float)  # SSN confirms identity — confidence based on name only
 
     det["bucket"] = np.where(
         det["match_flag"].isna(), "DET_AUTO_APPROVE",
@@ -980,11 +980,10 @@ def publish_mpi_output(bq):
     # 1) BigQuery — overwrite the single delivery table
     bq.query(f"""
         CREATE OR REPLACE TABLE `{MPI_OUTPUT_TABLE}` AS
-        SELECT * EXCEPT(DLN, name_score, street_score, confidence_score, composite_score),
+        SELECT * EXCEPT(DLN, property_rank, composite_score, name_score, street_score, confidence_score),
             ROUND(name_score, 1) AS name_score,
             ROUND(street_score, 1) AS street_score,
-            ROUND(confidence_score, 1) AS confidence_score,
-            ROUND(composite_score, 1) AS composite_score
+            ROUND(confidence_score, 1) AS confidence_score
         FROM `{REVIEW_CAPPED_V2}`
     """).result()
 

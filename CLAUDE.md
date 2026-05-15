@@ -176,6 +176,7 @@ Three SQL `CREATE TABLE AS SELECT` statements clean Kelmar, SOK (SSN-present), a
 ### 3. Deterministic match
 - `JOIN ON k.ssn_token = s.ssn_token` (SOK deduped by DLN via `ROW_NUMBER()`)
 - Output: `DET_MATCHES`
+- Confidence = `name_score` (not composite). SSN confirms identity — street differences are expected (Kelmar has old address, SOK has current driver license address). Street score is irrelevant to identity confidence for SSN-confirmed matches.
 
 ### 4. Fuzzy match
 Built only against Kelmar rows that did not match deterministically.
@@ -200,7 +201,7 @@ SOK candidate pool = `SOK_NULL_CLEAN` ∪ (SSN-present clean rows not in `DET_MA
 - Add `Eligibility_Flag` → `REVIEW_CAPPED_V2`
 
 ### 6. Publish MPI output
-- **BigQuery:** `citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch` — overwritten each run, DLN excluded, scores rounded to 1 decimal
+- **BigQuery:** `citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch` — overwritten each run. Excluded columns: DLN (PII), property_rank, composite_score. Scores (name_score, street_score, confidence_score) rounded to 1 decimal.
 - **GCS:** `gs://kelmar_outbound_files/kelmar_mpi_files/OK_OST_OMES_OUTBOUND_DataMatch_MDDYY.csv` — permanent dated copy, uploaded as single CSV via `google.cloud.storage`
 
 ---
