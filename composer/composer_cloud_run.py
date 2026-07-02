@@ -24,12 +24,26 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.models import Variable
 
 # ---------------------------------------------------------------------------
-# Constants
+# Environment config — driven by Airflow Variables so the same DAG runs
+# against dev/test/prod by changing Variables, not code. Defaults are dev (-np).
 # ---------------------------------------------------------------------------
-CLOUD_RUN_URL = "https://citizenmatch-pipeline-s3dq7cyrzq-uc.a.run.app"
-DE_DAG_ID     = "gcs_to_bq_unclaimed_property_ingestion"
+PROJECT_ID     = Variable.get("citizenmatch_project_id",      default_var="aw-ost-property-np")
+OUTPUT_DATASET = Variable.get("citizenmatch_output_dataset",  default_var="citizen_match")
+MPI_DATASET    = Variable.get("citizenmatch_mpi_dataset",     default_var="citizen_mpi_result")
+BQ_LOCATION    = Variable.get("citizenmatch_bq_location",     default_var="us-central1")
+CLOUD_RUN_URL  = Variable.get("citizenmatch_cloud_run_url",   default_var="https://citizenmatch-pipeline-s3dq7cyrzq-uc.a.run.app")
+
+# DE-owned DAGs — confirm the test names with the data engineer before the run
+DE_DAG_ID      = Variable.get("citizenmatch_ingestion_dag_id", default_var="gcs_to_bq_unclaimed_property_ingestion")
+AUDIT_DAG_ID   = Variable.get("citizenmatch_audit_dag_id",     default_var="kelmar_outbound")
+
+# Derived table paths the status poller watches
+SOK_TOKENIZED_TBL = f"{PROJECT_ID}.{OUTPUT_DATASET}.sok_staging_dataset_tokenized_v2"
+CHECKPOINT_TBL    = f"{PROJECT_ID}.{OUTPUT_DATASET}.sok_tokenization_checkpoint"
+OUTPUT_TBL        = f"{PROJECT_ID}.{MPI_DATASET}.OK_OST_OMES_OUTBOUND_DataMatch"
 
 MAX_ITERATIONS = 10
 
@@ -77,7 +91,7 @@ with DAG(
         hook = BigQueryHook(
             gcp_conn_id="google_cloud_default",
             use_legacy_sql=False,
-            location="us-central1",
+            location=BQ_LOCATION,
         )
 
         def _bq_count(sql):
@@ -90,18 +104,9 @@ with DAG(
 
         def _get_status():
             """Check pipeline status from BigQuery tables."""
-            tokenized = _bq_count(
-                "SELECT COUNT(*) FROM "
-                "`aw-ost-property-np.citizen_match.sok_staging_dataset_tokenized_v2`"
-            )
-            checkpoint = _bq_count(
-                "SELECT COUNT(*) FROM "
-                "`aw-ost-property-np.citizen_match.sok_tokenization_checkpoint`"
-            )
-            output = _bq_count(
-                "SELECT COUNT(*) FROM "
-                "`aw-ost-property-np.citizen_mpi_result.OK_OST_OMES_OUTBOUND_DataMatch`"
-            )
+            tokenized  = _bq_count(f"SELECT COUNT(*) FROM `{SOK_TOKENIZED_TBL}`")
+            checkpoint = _bq_count(f"SELECT COUNT(*) FROM `{CHECKPOINT_TBL}`")
+            output     = _bq_count(f"SELECT COUNT(*) FROM `{OUTPUT_TBL}`")
             return tokenized, checkpoint, output
 
         for i in range(1, MAX_ITERATIONS + 1):
@@ -202,7 +207,7 @@ with DAG(
     # Step 3: Trigger audit pipeline after matching completes
     trigger_audit = TriggerDagRunOperator(
         task_id="trigger_audit_pipeline",
-        trigger_dag_id="kelmar_outbound",
+        trigger_dag_id=AUDIT_DAG_ID,
         wait_for_completion=False,
         execution_timeout=timedelta(minutes=5),
     )

@@ -14,9 +14,10 @@ MPI_DATASET     = os.environ.get("MPI_DATASET", "citizen_mpi_result")
 
 IMPERSONATE_SA = os.environ.get("IMPERSONATE_SA", "")
 
+DLP_TEMPLATE_ID = os.environ.get("DLP_TEMPLATE_ID", "4648784086040580254")
 DLP_TEMPLATE_NAME = (
     f"projects/{PROJECT_ID}/locations/{LOCATION}"
-    "/deidentifyTemplates/4648784086040580254"
+    f"/deidentifyTemplates/{DLP_TEMPLATE_ID}"
 )
 DLP_BATCH_SIZE = 200
 MAX_RETRIES    = 6
@@ -55,8 +56,8 @@ UNMATCHED_TABLE   = f"{PROJECT_ID}.{OUTPUT_DATASET}.treasury_unmatched_v1"
 MPI_OUTPUT_TABLE = f"{PROJECT_ID}.{MPI_DATASET}.OK_OST_OMES_OUTBOUND_DataMatch"
 
 # GCS bucket for dated copies (never overwritten)
-GCS_MPI_BUCKET   = "kelmar_outbound_files"
-GCS_MPI_PATH     = "kelmar_mpi_files"
+GCS_MPI_BUCKET   = os.environ.get("GCS_MPI_BUCKET", "kelmar_outbound_files")
+GCS_MPI_PATH     = os.environ.get("GCS_MPI_PATH", "kelmar_mpi_files")
 
 BLOCK1_CONFIDENCE_CAP  = 95
 BLOCK2_CONFIDENCE_CAP  = 85
