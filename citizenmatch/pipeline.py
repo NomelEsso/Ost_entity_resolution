@@ -1,17 +1,4 @@
-"""
-CitizenMatch pipeline — core matching logic.
 
-Stages:
-  1. Tokenize SSNs (Kelmar + SOK) via Cloud DLP
-  2. Clean both datasets
-  3. Deterministic SSN matching
-  4. Fuzzy matching (Block 1: ZIP+Last+DOB, Block 2: ZIP+Last)
-  5. Combine, dedupe, enrich, cap candidates
-  6. Produce delivery + unmatched tables
-  7. Publish MPI output (BQ overwrite + GCS dated copy)
-
-Called by main.py via run_pipeline().
-"""
 
 import logging
 import time
@@ -47,9 +34,7 @@ from bq_udfs import create_cleaning_udfs
 log = logging.getLogger(__name__)
 
 
-# ===========================================================================
-# BigQuery / DLP client setup
-# ===========================================================================
+
 
 def _get_bq_client():
     """Return a BigQuery client, optionally using SA impersonation."""
@@ -91,9 +76,7 @@ def _write_to_bq(bq, df, table_id, truncate=True):
     job.result()
 
 
-# ===========================================================================
-# Stage 1: DLP tokenization
-# ===========================================================================
+
 
 def _tokenize_batch(dlp, ssns, batch_size=DLP_BATCH_SIZE):
     """Tokenise a list of SSN strings via Cloud DLP TABLE item.
@@ -204,9 +187,7 @@ def tokenize_sok(bq, dlp):
     except Exception:
         pass
 
-    # =====================================================================
-    # MODE 1: INITIAL LOAD (checkpoint exists OR no data yet)
-    # =====================================================================
+
     if has_checkpoint or existing_count == 0:
         if has_checkpoint:
             log.info("  INITIAL LOAD — resuming from checkpoint (%d rows exist)", existing_count)
@@ -335,9 +316,7 @@ def tokenize_sok(bq, dlp):
                  total, existing_count + total, SOK_TOKENIZED)
         return
 
-    # =====================================================================
-    # MODE 2: INCREMENTAL (no checkpoint + data exists = initial load done)
-    # =====================================================================
+
     log.info("  INCREMENTAL — checking for new _data_file_date_ values")
 
     new_dates = bq.query(f"""
@@ -400,9 +379,8 @@ def tokenize_sok(bq, dlp):
              total, existing_count + total, SOK_TOKENIZED)
 
 
-# ===========================================================================
 # Stage 2: Cleaning
-# ===========================================================================
+
 
 def clean_sok_table(bq):
     """Clean SOK tokenized (SSN-present) rows via BigQuery SQL — zero memory footprint."""
@@ -523,9 +501,7 @@ def clean_sok_null_table(bq):
     log.info("✅ SOK SSN-null cleaned: %s rows → %s", count["n"].iloc[0], SOK_NULL_CLEAN)
 
 
-# ===========================================================================
 # Stage 3: Deterministic SSN matching
-# ===========================================================================
 
 def deterministic_match(bq):
     """Join Kelmar ↔ SOK on ssn_token (deduped by DLN) → ssn_deterministic_matches_v1."""
@@ -603,9 +579,8 @@ def identify_unmatched_kelmar(bq):
     log.info("✅ Unmatched Kelmar (→ fuzzy): %s rows", count["n"].iloc[0])
 
 
-# ===========================================================================
 # Stage 4: Fuzzy matching
-# ===========================================================================
+
 
 def build_fuzzy_pool(bq):
     """Combine SSN-null + unmatched SSN-present SOK rows → sok_fuzzy_pool_v1."""
@@ -730,9 +705,7 @@ def fuzzy_block2(bq):
     log.info("  %s", df["bucket"].value_counts().to_dict())
 
 
-# ===========================================================================
 # Stage 5: Combine, dedupe, enrich
-# ===========================================================================
 
 def assemble_review_table(bq):
     """Merge deterministic + fuzzy results → treasury_match_review_v2."""
@@ -755,7 +728,7 @@ def assemble_review_table(bq):
         ) = 1
     """).to_dataframe()
 
-    # --- Deterministic: join back for full fields (SOK deduped by DLN) ---
+    # Deterministic: join back for full fields (SOK deduped by DLN)
     det = bq.query(f"""
         WITH sok_latest AS (
           SELECT *, ROW_NUMBER() OVER (
@@ -804,7 +777,7 @@ def assemble_review_table(bq):
     det = det.merge(dln_map, on="DLN", how="left")
     log.info("  deterministic rows: %d", len(det))
 
-    # --- Load fuzzy blocks ---
+    # Load fuzzy blocks
     b1 = bq.query(f"SELECT * FROM `{BLOCK1_CLASSIFIED}`").to_dataframe()
     b2 = bq.query(f"SELECT * FROM `{BLOCK2_CLASSIFIED}`").to_dataframe()
 
@@ -822,7 +795,7 @@ def assemble_review_table(bq):
     b1["match_flag"] = None
     b2["match_flag"] = None
 
-    # --- Standardize columns ---
+    # Standardize columns
     cols = [
         "OwnerID", "PropertyID", "DLN",
         "Transaction_ID", "_data_file_date_",
@@ -837,7 +810,7 @@ def assemble_review_table(bq):
         if missing:
             raise ValueError(f"{label} missing columns: {missing}")
 
-    # --- Combine + dedupe ---
+    # Combine + dedupe
     combined = pd.concat([det[cols], b1[cols], b2[cols]], ignore_index=True)
     combined = (
         combined.sort_values("confidence_score", ascending=False)
@@ -960,9 +933,8 @@ def build_unmatched_table(bq):
     log.info("✅ Unmatched: %s rows → %s", count["n"].iloc[0], UNMATCHED_TABLE)
 
 
-# ===========================================================================
+
 # Stage 6: Publish MPI output
-# ===========================================================================
 
 def publish_mpi_output(bq):
     """Publish final results to BigQuery and GCS.
@@ -1006,9 +978,7 @@ def publish_mpi_output(bq):
     log.info("✅ GCS output: gs://%s/%s", GCS_MPI_BUCKET, gcs_path)
 
 
-# ===========================================================================
 # Entry point
-# ===========================================================================
 
 def run_pipeline():
     """Execute the full CitizenMatch pipeline end-to-end."""

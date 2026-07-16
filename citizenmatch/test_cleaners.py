@@ -1,7 +1,4 @@
-"""
-Local tests for cleaners.py — no GCP needed.
-Run: python citizenmatch/test_cleaners.py
-"""
+
 
 from cleaners import clean_name, clean_street, clean_state, clean_zip, similarity
 
@@ -94,8 +91,8 @@ def test_clean_zip():
 def test_similarity():
     tests = [
         ("JOHN SMITH",   "JOHN SMITH",    100),
-        ("JOHN SMITH",   "JON SMITH",     None),  # just check it's > 80
-        ("JOHN SMITH",   "JANE DOE",      None),  # just check it's < 50
+        ("JOHN SMITH",   "JON SMITH",     None),  
+        ("JOHN SMITH",   "JANE DOE",      None),  
         (None,           "JOHN",          0),
     ]
     print("\n=== similarity ===")

@@ -1,10 +1,4 @@
-"""
-Flask entry point for the CitizenMatch Cloud Run service.
 
-Routes:
-  POST /  → run the full pipeline
-  GET  /  → health check
-"""
 
 import logging
 import os
@@ -14,9 +8,7 @@ from flask import Flask, jsonify
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Logging — Cloud Run captures stdout/stderr automatically
-# ---------------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",

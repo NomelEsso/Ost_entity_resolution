@@ -1,13 +1,4 @@
-"""
-Composer DAG: Ephemeral Dataproc cluster for PySpark ETL.
 
-Lifecycle:
-  1. Create cluster with Oracle JDBC + Python dependencies.
-  2. Submit PySpark job from GCS.
-  3. Delete cluster (runs even on failure via ALL_DONE trigger).
-
-Schedule: Daily at 04:00 America/Chicago.
-"""
 
 from airflow import models
 from airflow.providers.google.cloud.operators.dataproc import (
@@ -18,9 +9,8 @@ from airflow.providers.google.cloud.operators.dataproc import (
 from airflow.utils.trigger_rule import TriggerRule
 import pendulum
 
-# ---------------------------------------------------------------------------
-# Constants — update every placeholder before deploying
-# ---------------------------------------------------------------------------
+# Constants
+
 PROJECT_ID              = "<project-id>"
 REGION                  = "us-central1"
 CLUSTER_NAME            = "<cluster-name>"
@@ -49,9 +39,8 @@ PIP_PACKAGES = ",".join([
     "pyarrow==10.0.1",
 ])
 
-# ---------------------------------------------------------------------------
 # DAG
-# ---------------------------------------------------------------------------
+
 with models.DAG(
     dag_id="dataproc_pyspark_etl",
     description="Create Dataproc cluster, run PySpark job, then delete cluster.",

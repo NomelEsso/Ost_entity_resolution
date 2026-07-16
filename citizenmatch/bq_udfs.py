@@ -1,20 +1,11 @@
 """
 BigQuery JavaScript UDFs for data cleaning.
-
-Created as persistent functions in the citizen_match dataset.
-Replicate the exact logic from cleaners.py but run server-side —
-no data moves to Cloud Run memory.
-
-Called once by pipeline.py on startup (idempotent).
 """
 
 import logging
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# JavaScript UDF bodies (raw strings — no Python formatting conflicts)
-# ---------------------------------------------------------------------------
 
 _CLEAN_NAME_JS = r"""
     if (!val || val.trim() === '') return null;
@@ -69,9 +60,6 @@ _CLEAN_ZIP_JS = r"""
 """
 
 
-# ---------------------------------------------------------------------------
-# UDF creation (idempotent)
-# ---------------------------------------------------------------------------
 
 def create_cleaning_udfs(bq, dataset_ref):
     """Create all cleaning UDFs in the given dataset.
@@ -93,7 +81,7 @@ def create_cleaning_udfs(bq, dataset_ref):
     bq.query(sql).result()
     log.info("  ✅ clean_name")
 
-    # clean_street (accepts 3 parts — pass NULL for unused parts)
+    # clean_street
     sql = (
         "CREATE OR REPLACE FUNCTION `%s.clean_street`(val1 STRING, val2 STRING, val3 STRING) "
         "RETURNS STRING "

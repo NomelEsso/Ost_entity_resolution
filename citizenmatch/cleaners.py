@@ -1,9 +1,3 @@
-"""
-Data cleaning and standardization functions.
-Used for both Kelmar and SOK datasets to ensure consistent comparison.
-
-Single source of truth — imported by pipeline.py.
-"""
 
 import re
 import unicodedata
@@ -12,9 +6,7 @@ import pandas as pd
 from rapidfuzz import fuzz
 
 
-# ---------------------------------------------------------------------------
-# Low-level helpers
-# ---------------------------------------------------------------------------
+
 
 def rm_accents(x: str) -> str:
     """Strip accented characters to ASCII equivalents."""
@@ -26,9 +18,7 @@ def collapse_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-# ---------------------------------------------------------------------------
-# Regex patterns
-# ---------------------------------------------------------------------------
+
 
 PUNCT_NAME_DROP = r"[^A-Z'\-\s]"
 PUNCT_ADDR_KEEP = r"[^A-Z0-9'\-\s]"
@@ -52,9 +42,7 @@ _STREET_PAT = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# Field-level cleaners
-# ---------------------------------------------------------------------------
+
 
 def clean_name(val):
     """Normalise a name field: uppercase, strip titles/punctuation, collapse whitespace."""
@@ -117,9 +105,8 @@ def clean_street(*parts):
     return v or None
 
 
-# ---------------------------------------------------------------------------
+
 # DataFrame-level helpers
-# ---------------------------------------------------------------------------
 
 def build_full_name(df):
     """Create full_name_clean from first/middle/last_name_clean columns."""
@@ -176,9 +163,8 @@ def clean_kelmar_address(df):
     return df
 
 
-# ---------------------------------------------------------------------------
+
 # Similarity scoring
-# ---------------------------------------------------------------------------
 
 def similarity(a, b):
     """Weighted ratio similarity (0–100). Returns 0 if either value is null."""
